@@ -3,7 +3,7 @@
 *.translation
 *.import
 
-# Export presets (contains sensitive paths)
+# Export presets
 export_presets.cfg
 
 # macOS
@@ -11,3 +11,8 @@ export_presets.cfg
 
 # Editor metadata
 .mono/
+
+# Node.js
+node_modules/
+package.json
+package-lock.json
