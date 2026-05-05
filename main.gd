@@ -11,6 +11,9 @@ const ROTATE_SPEED = 0.005
 const TICK_SPEED = 5.0
 var tick_timer = 0.0
 
+# Set to true when server is implemented
+const USE_SERVER = false
+
 const DOT_LIFETIME = 100  # ticks before a dot dies
 
 # All dots and their per-dot data
@@ -164,6 +167,15 @@ func _zoom(delta: float):
 	zoom_target = clamp(zoom_target + delta, ZOOM_MIN, ZOOM_MAX)
 
 func _process_input(text: String):
+	if USE_SERVER:
+		_send_chant_to_server(text)  # TODO: implement when server is ready
+	else:
+		_process_chant_locally(text)
+
+func _send_chant_to_server(_text: String):
+	pass  # HTTP call to server goes here
+
+func _process_chant_locally(text: String):
 	var lower = text.to_lower().strip_edges()
 	var behavior = INTENT_MAP.get(lower, "idle")
 	current_behavior = behavior
