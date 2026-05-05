@@ -29,10 +29,7 @@ const DIAL_BASELINE = {
 const NEUTRAL_CCE = {
 	"motion": {
 		"wander": 0.0,
-		"cluster": 0.0,
-		"spread": 0.0,
 		"face_target": 0.0,
-		"spiral": 0.0
 	},
 	"action": {
 		"mark_surface": 0.0,
@@ -46,7 +43,8 @@ const NEUTRAL_CCE = {
 		"range": 0.5,
 		"intensity": 0.5,
 		"frequency": 1.0,
-		"affinity": 0.0
+		"affinity": 0.0,
+		"spiral": 0.0
 	}
 }
 
@@ -69,6 +67,7 @@ var player_dot = null
 @onready var chant_input = $UI/ChantModal/VBox/ChantInput
 @onready var confirm_button = $UI/ChantModal/VBox/ButtonRow/ConfirmButton
 @onready var cancel_button = $UI/ChantModal/VBox/ButtonRow/CancelButton
+@onready var dev_bar = $UI/DevBar
 
 # Zoom state
 var zoom_target = 3.0
@@ -94,6 +93,8 @@ func _ready():
 	confirm_button.pressed.connect(_confirm_chant)
 	cancel_button.pressed.connect(_close_chant)
 	chant_input.text_submitted.connect(_on_chant_submitted)
+	dev_bar.placeholder_text = "dev chant..."
+	dev_bar.text_submitted.connect(_on_dev_chant)
 
 func _open_chant():
 	chant_modal.visible = true
@@ -111,6 +112,10 @@ func _confirm_chant():
 func _on_chant_submitted(text: String):
 	_process_input(text)
 	_close_chant()
+
+func _on_dev_chant(text: String):
+	_process_input(text)
+	dev_bar.clear()
 
 func _process(delta):
 	zoom_distance = lerp(zoom_distance, zoom_target, ZOOM_SMOOTH * delta)
@@ -192,12 +197,8 @@ func _local_recipe(word: String) -> Dictionary:
 	match word:
 		"wander", "explore", "roam":
 			return { "motion": { "wander": CHANT_WEIGHT }, "dials": { "range": 0.05 } }
-		"cluster", "gather together":
-			return { "motion": { "cluster": CHANT_WEIGHT } }
-		"spread", "expand":
-			return { "motion": { "spread": CHANT_WEIGHT } }
 		"spiral":
-			return { "motion": { "spiral": CHANT_WEIGHT } }
+			return { "dials": { "spiral": 0.1 } }
 		"reproduce", "multiply", "sex", "breed":
 			return { "action": { "reproduce": CHANT_WEIGHT } }
 		"attack", "fight", "war":
@@ -264,59 +265,32 @@ func _tick_dot(dot: Node3D):
 func _execute_primitive(dot: Node3D, primitive: String, dials: Dictionary):
 	var range_val = dials.get("range", 0.5)
 	var intensity = dials.get("intensity", 0.5)
+	var spiral = dials.get("spiral", 0.0)
 
 	match primitive:
 		"wander":
 			var nudge_amount = lerp(0.01, 0.08, range_val)
 			var dir = dot.position.normalized()
-			var tangent = dir.cross(Vector3(randf_range(-1,1), randf_range(-1,1), randf_range(-1,1))).normalized()
+			var tangent: Vector3
+			if spiral > 0.1:
+				# Spiral modifier — bias tangent direction consistently
+				var up = Vector3.UP if abs(dir.dot(Vector3.UP)) < 0.99 else Vector3.FORWARD
+				tangent = dir.cross(up).normalized()
+				nudge_amount *= (1.0 + spiral)
+			else:
+				tangent = dir.cross(Vector3(randf_range(-1,1), randf_range(-1,1), randf_range(-1,1))).normalized()
 			var new_dir = (dir + tangent * nudge_amount).normalized()
 			_place_dot_on_sphere(dot, new_dir)
-		"cluster":
-			# Move toward colony center
-			var center = _colony_center()
-			var dir = dot.position.normalized()
-			var toward = (center - dir).normalized()
-			var nudge = lerp(0.005, 0.04, range_val)
-			var new_dir = (dir + toward * nudge).normalized()
-			_place_dot_on_sphere(dot, new_dir)
-		"spread":
-			# Move away from colony center
-			var center = _colony_center()
-			var dir = dot.position.normalized()
-			var away = (dir - center).normalized()
-			var nudge = lerp(0.005, 0.04, range_val)
-			var new_dir = (dir + away * nudge).normalized()
-			_place_dot_on_sphere(dot, new_dir)
-		"spiral":
-			var dir = dot.position.normalized()
-			var up = Vector3.UP if abs(dir.dot(Vector3.UP)) < 0.99 else Vector3.FORWARD
-			var tangent = dir.cross(up).normalized()
-			var nudge = lerp(0.01, 0.05, range_val)
-			var new_dir = (dir + tangent * nudge).normalized()
-			_place_dot_on_sphere(dot, new_dir)
 		"reproduce":
-			# Probability check — intensity drives reproduction chance
 			var chance = lerp(0.1, 0.9, intensity)
 			if randf() < chance:
 				_spawn_dot_near(dot)
-		"attack":
-			print("TODO: attack — needs foreign dot detection")
 		"defend":
-			# Cluster tightly — low range movement toward neighbors
 			var dir = dot.position.normalized()
 			var center = _colony_center()
 			var toward = (center - dir).normalized()
 			var new_dir = (dir + toward * 0.01).normalized()
 			_place_dot_on_sphere(dot, new_dir)
-		"gather":
-			print("TODO: gather — needs resource system")
-		"build_upward":
-			print("TODO: build — needs surface marking system")
-		"mark_surface":
-			print("TODO: mark_surface — needs surface marking system")
-		"face_target":
-			print("TODO: face_target — needs target system")
 
 func _colony_center() -> Vector3:
 	var center = Vector3.ZERO
