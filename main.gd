@@ -11,12 +11,18 @@ const ROTATE_SPEED = 0.005
 const TICK_SPEED = 5.0
 var tick_timer = 0.0
 
+const DOT_LIFETIME = 100  # ticks before a dot dies
+
+# All dots and their per-dot data
 var dots = []
-var dot_ages = {}  # tracks tick age of each dot
+var dot_data = {}
+# dot_data[dot] = {
+#     "age": int,          — ticks lived
+#     "behavior": String,  — current active behavior (placeholder for per-dot behavior later)
+# }
+
 var player_dot = null
 var current_behavior = "idle"
-
-const DOT_LIFETIME = 100  # ticks before a dot dies
 
 @onready var camera = $Camera3D
 @onready var chant_button = $UI/ChantButton
@@ -95,18 +101,15 @@ func _process(delta):
 			_apply_behavior(current_behavior)
 
 func _focus_on_colony():
-	# Point camera toward the average position of all dots
 	var center = Vector3.ZERO
 	for dot in dots:
 		center += dot.position.normalized()
 	if dots.size() > 0:
 		center = (center / dots.size()).normalized()
-	# Convert colony center direction to yaw/pitch
 	orbit_yaw = atan2(center.x, center.z)
 	orbit_pitch = asin(clamp(center.y, -1.0, 1.0))
 
 func _update_camera():
-	# Orbit camera around the sphere using yaw/pitch angles
 	var pitch_clamped = clamp(orbit_pitch, -PI / 2.0 + 0.05, PI / 2.0 - 0.05)
 	var x = zoom_distance * cos(pitch_clamped) * sin(orbit_yaw)
 	var y = zoom_distance * sin(pitch_clamped)
@@ -115,7 +118,6 @@ func _update_camera():
 	camera.look_at(Vector3.ZERO, Vector3.UP)
 
 func _input(event):
-	# --- Desktop: RMB drag to orbit ---
 	if event is InputEventMouseButton:
 		if event.button_index == MOUSE_BUTTON_RIGHT:
 			is_orbiting = event.pressed
@@ -129,11 +131,9 @@ func _input(event):
 		orbit_yaw -= event.relative.x * ROTATE_SPEED
 		orbit_pitch += event.relative.y * ROTATE_SPEED
 
-	# --- Mobile: touch tracking ---
 	if event is InputEventScreenTouch:
 		if event.pressed:
 			touch_positions[event.index] = event.position
-			# First finger down = potential orbit
 			if touch_positions.size() == 1:
 				single_touch_active = true
 				single_touch_index = event.index
@@ -146,14 +146,10 @@ func _input(event):
 
 	if event is InputEventScreenDrag:
 		touch_positions[event.index] = event.position
-
 		if touch_positions.size() == 1 and single_touch_active:
-			# Single finger = orbit
 			orbit_yaw -= event.relative.x * ROTATE_SPEED
 			orbit_pitch += event.relative.y * ROTATE_SPEED
-
 		elif touch_positions.size() >= 2:
-			# Two fingers = pinch zoom
 			single_touch_active = false
 			var keys = touch_positions.keys()
 			var t0 = touch_positions[keys[0]]
@@ -175,25 +171,24 @@ func _process_input(text: String):
 	_apply_behavior(behavior)
 
 func _apply_behavior(behavior: String):
-	# Snapshot current dots so newly spawned ones don't loop this frame
 	var current_dots = dots.duplicate()
 	match behavior:
 		"reproduce":
 			for dot in current_dots:
 				_spawn_dot_near(dot)
 		"construct":
-			print("TODO: construct city structure near dot")
+			print("TODO: construct")
 		"explore":
 			for dot in current_dots:
 				_move_dot_randomly(dot)
 		"aggressive":
-			print("TODO: aggressive expansion")
+			print("TODO: aggressive")
 		"defend":
-			print("TODO: defensive formation")
+			print("TODO: defend")
 		"gather":
-			print("TODO: gather resources")
+			print("TODO: gather")
 		"idle":
-			print("No recognized behavior — dot is idle")
+			print("Idle")
 
 func _spawn_player_dot():
 	var angle = randf() * TAU
@@ -236,19 +231,22 @@ func _create_dot(direction: Vector3) -> Node3D:
 	dot.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
 	add_child(dot)
 	dots.append(dot)
-	dot_ages[dot] = 0
+	dot_data[dot] = {
+		"age": 0,
+		"behavior": "idle",
+	}
 	_place_dot_on_sphere(dot, direction)
 	return dot
 
 func _age_dots():
 	var to_remove = []
 	for dot in dots:
-		dot_ages[dot] += 1
-		if dot_ages[dot] >= DOT_LIFETIME:
+		dot_data[dot]["age"] += 1
+		if dot_data[dot]["age"] >= DOT_LIFETIME:
 			to_remove.append(dot)
 	for dot in to_remove:
 		dots.erase(dot)
-		dot_ages.erase(dot)
+		dot_data.erase(dot)
 		if dot == player_dot:
 			player_dot = dots[0] if dots.size() > 0 else null
 		dot.queue_free()
@@ -256,7 +254,6 @@ func _age_dots():
 func _place_dot_on_sphere(dot: Node3D, direction: Vector3):
 	var dir = direction.normalized()
 	dot.position = dir * (SPHERE_RADIUS + 0.0075)
-	# Orient cube so its base faces the sphere surface
 	var basis = Basis()
 	basis.y = dir
 	basis.x = basis.y.cross(Vector3.FORWARD if abs(dir.dot(Vector3.FORWARD)) < 0.99 else Vector3.RIGHT).normalized()
