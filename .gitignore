@@ -16,3 +16,6 @@ export_presets.cfg
 node_modules/
 package.json
 package-lock.json
+
+# Live chant bridge
+chant.json

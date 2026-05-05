@@ -11,21 +11,57 @@ const ROTATE_SPEED = 0.005
 const TICK_SPEED = 5.0
 var tick_timer = 0.0
 
-# Set to true when server is implemented
 const USE_SERVER = false
+const DOT_LIFETIME = 100
+const CCE_DILUTION = 0.7
+const CHANT_WEIGHT = 0.08  # how much each chant shifts a weight
+const CHANT_FILE = "res://chant.json"
 
-const DOT_LIFETIME = 100  # ticks before a dot dies
+# Baseline dial values
+const DIAL_BASELINE = {
+	"range": 0.5,
+	"intensity": 0.5,
+	"frequency": 1.0,
+	"affinity": 0.0
+}
 
-# All dots and their per-dot data
+# Neutral CCE for a new dot with no cultural history
+const NEUTRAL_CCE = {
+	"motion": {
+		"wander": 0.0,
+		"cluster": 0.0,
+		"spread": 0.0,
+		"face_target": 0.0,
+		"spiral": 0.0
+	},
+	"action": {
+		"mark_surface": 0.0,
+		"build_upward": 0.0,
+		"gather": 0.0,
+		"defend": 0.0,
+		"attack": 0.0,
+		"reproduce": 0.0
+	},
+	"dials": {
+		"range": 0.5,
+		"intensity": 0.5,
+		"frequency": 1.0,
+		"affinity": 0.0
+	}
+}
+
 var dots = []
 var dot_data = {}
 # dot_data[dot] = {
-#     "age": int,          — ticks lived
-#     "behavior": String,  — current active behavior (placeholder for per-dot behavior later)
+#   "age": int,
+#   "cce": {
+#     "motion": { wander, cluster, spread, face_target, spiral },
+#     "action": { mark_surface, build_upward, gather, defend, attack, reproduce },
+#     "dials": { range, intensity, frequency, affinity }
+#   }
 # }
 
 var player_dot = null
-var current_behavior = "idle"
 
 @onready var camera = $Camera3D
 @onready var chant_button = $UI/ChantButton
@@ -47,24 +83,9 @@ var is_orbiting = false
 var touch_positions = {}
 var pinch_last_distance = 0.0
 
-# Single finger drag (mobile orbit)
+# Single finger drag
 var single_touch_active = false
 var single_touch_index = -1
-
-const INTENT_MAP = {
-	"multiply": "reproduce", "sex": "reproduce", "reproduce": "reproduce",
-	"breed": "reproduce", "spawn": "reproduce", "clone": "reproduce", "divide": "reproduce",
-	"build": "construct", "create": "construct", "invent": "construct",
-	"construct": "construct", "make": "construct", "design": "construct", "forge": "construct",
-	"explore": "explore", "wander": "explore", "move": "explore",
-	"travel": "explore", "roam": "explore", "search": "explore",
-	"attack": "aggressive", "dominate": "aggressive", "fight": "aggressive",
-	"conquer": "aggressive", "destroy": "aggressive", "war": "aggressive",
-	"defend": "defend", "protect": "defend", "guard": "defend",
-	"shield": "defend", "fortify": "defend",
-	"gather": "gather", "collect": "gather", "harvest": "gather",
-	"mine": "gather", "farm": "gather",
-}
 
 func _ready():
 	_spawn_player_dot()
@@ -95,20 +116,220 @@ func _process(delta):
 	zoom_distance = lerp(zoom_distance, zoom_target, ZOOM_SMOOTH * delta)
 	zoom_distance = max(zoom_distance, ZOOM_MIN)
 	_update_camera()
-	# Behavior tick
 	tick_timer += delta
 	if tick_timer >= TICK_SPEED:
 		tick_timer = 0.0
+		_check_chant_file()
 		_age_dots()
-		if current_behavior != "idle":
-			_apply_behavior(current_behavior)
+		_tick_all_dots()
 
-func _focus_on_colony():
+# --- Chant file (Claude bridge) ---
+
+func _check_chant_file():
+	if not FileAccess.file_exists(CHANT_FILE):
+		return
+	var file = FileAccess.open(CHANT_FILE, FileAccess.READ)
+	if file == null:
+		return
+	var content = file.get_as_text().strip_edges()
+	file.close()
+	if content == "" or content == "{}":
+		return
+	var json = JSON.new()
+	var err = json.parse(content)
+	if err != OK:
+		print("chant.json parse error")
+		return
+	var recipe = json.get_data()
+	_apply_recipe(recipe)
+	# Clear the file after reading
+	var clear = FileAccess.open(CHANT_FILE, FileAccess.WRITE)
+	if clear:
+		clear.store_string("{}")
+		clear.close()
+
+func _apply_recipe(recipe: Dictionary):
+	print("Applying recipe: ", recipe)
+	for dot in dots:
+		var cce = dot_data[dot]["cce"]
+		# Apply motion weight deltas
+		if recipe.has("motion"):
+			for key in recipe["motion"]:
+				if cce["motion"].has(key):
+					cce["motion"][key] = clamp(cce["motion"][key] + recipe["motion"][key], 0.0, 1.0)
+		# Apply action weight deltas
+		if recipe.has("action"):
+			for key in recipe["action"]:
+				if cce["action"].has(key):
+					cce["action"][key] = clamp(cce["action"][key] + recipe["action"][key], 0.0, 1.0)
+		# Apply dial deltas
+		if recipe.has("dials"):
+			for key in recipe["dials"]:
+				if cce["dials"].has(key):
+					cce["dials"][key] = clamp(cce["dials"][key] + recipe["dials"][key], 0.0, 1.0)
+
+# --- In-game chant (local fallback while testing) ---
+
+func _process_input(text: String):
+	if USE_SERVER:
+		_send_chant_to_server(text)
+	else:
+		_process_chant_locally(text)
+
+func _send_chant_to_server(_text: String):
+	pass
+
+func _process_chant_locally(text: String):
+	# Simple local recipes for testing without Claude bridge
+	var lower = text.to_lower().strip_edges()
+	var recipe = _local_recipe(lower)
+	if recipe.is_empty():
+		print("No local recipe for: ", text)
+		return
+	_apply_recipe(recipe)
+
+func _local_recipe(word: String) -> Dictionary:
+	match word:
+		"wander", "explore", "roam":
+			return { "motion": { "wander": CHANT_WEIGHT }, "dials": { "range": 0.05 } }
+		"cluster", "gather together":
+			return { "motion": { "cluster": CHANT_WEIGHT } }
+		"spread", "expand":
+			return { "motion": { "spread": CHANT_WEIGHT } }
+		"spiral":
+			return { "motion": { "spiral": CHANT_WEIGHT } }
+		"reproduce", "multiply", "sex", "breed":
+			return { "action": { "reproduce": CHANT_WEIGHT } }
+		"attack", "fight", "war":
+			return { "action": { "attack": CHANT_WEIGHT }, "dials": { "intensity": 0.05 } }
+		"defend", "protect", "guard":
+			return { "action": { "defend": CHANT_WEIGHT } }
+		"gather", "collect", "harvest":
+			return { "action": { "gather": CHANT_WEIGHT } }
+		"build", "construct":
+			return { "action": { "build_upward": CHANT_WEIGHT } }
+		"mark", "paint":
+			return { "action": { "mark_surface": CHANT_WEIGHT } }
+		"far", "farther", "distant":
+			return { "dials": { "range": 0.1 } }
+		"close", "near", "tight":
+			return { "dials": { "range": -0.1 } }
+		"fierce", "sharp", "strong":
+			return { "dials": { "intensity": 0.1 } }
+		"gentle", "soft", "slow":
+			return { "dials": { "intensity": -0.1 } }
+		_:
+			return {}
+
+# --- Per-dot CCE tick ---
+
+func _tick_all_dots():
+	for dot in dots:
+		_tick_dot(dot)
+
+func _tick_dot(dot: Node3D):
+	var cce = dot_data[dot]["cce"]
+
+	# Build weighted pool from motion + action
+	var pool = {}
+	for key in cce["motion"]:
+		if cce["motion"][key] > 0.0:
+			pool[key] = cce["motion"][key]
+	for key in cce["action"]:
+		if cce["action"][key] > 0.0:
+			pool[key] = cce["action"][key]
+
+	# If pool is empty dot idles
+	if pool.is_empty():
+		return
+
+	# Weighted random selection
+	var total = 0.0
+	for key in pool:
+		total += pool[key]
+	var roll = randf() * total
+	var chosen = ""
+	var cumulative = 0.0
+	for key in pool:
+		cumulative += pool[key]
+		if roll <= cumulative:
+			chosen = key
+			break
+
+	if chosen == "":
+		return
+
+	_execute_primitive(dot, chosen, cce["dials"])
+
+func _execute_primitive(dot: Node3D, primitive: String, dials: Dictionary):
+	var range_val = dials.get("range", 0.5)
+	var intensity = dials.get("intensity", 0.5)
+
+	match primitive:
+		"wander":
+			var nudge_amount = lerp(0.01, 0.08, range_val)
+			var dir = dot.position.normalized()
+			var tangent = dir.cross(Vector3(randf_range(-1,1), randf_range(-1,1), randf_range(-1,1))).normalized()
+			var new_dir = (dir + tangent * nudge_amount).normalized()
+			_place_dot_on_sphere(dot, new_dir)
+		"cluster":
+			# Move toward colony center
+			var center = _colony_center()
+			var dir = dot.position.normalized()
+			var toward = (center - dir).normalized()
+			var nudge = lerp(0.005, 0.04, range_val)
+			var new_dir = (dir + toward * nudge).normalized()
+			_place_dot_on_sphere(dot, new_dir)
+		"spread":
+			# Move away from colony center
+			var center = _colony_center()
+			var dir = dot.position.normalized()
+			var away = (dir - center).normalized()
+			var nudge = lerp(0.005, 0.04, range_val)
+			var new_dir = (dir + away * nudge).normalized()
+			_place_dot_on_sphere(dot, new_dir)
+		"spiral":
+			var dir = dot.position.normalized()
+			var up = Vector3.UP if abs(dir.dot(Vector3.UP)) < 0.99 else Vector3.FORWARD
+			var tangent = dir.cross(up).normalized()
+			var nudge = lerp(0.01, 0.05, range_val)
+			var new_dir = (dir + tangent * nudge).normalized()
+			_place_dot_on_sphere(dot, new_dir)
+		"reproduce":
+			# Probability check — intensity drives reproduction chance
+			var chance = lerp(0.1, 0.9, intensity)
+			if randf() < chance:
+				_spawn_dot_near(dot)
+		"attack":
+			print("TODO: attack — needs foreign dot detection")
+		"defend":
+			# Cluster tightly — low range movement toward neighbors
+			var dir = dot.position.normalized()
+			var center = _colony_center()
+			var toward = (center - dir).normalized()
+			var new_dir = (dir + toward * 0.01).normalized()
+			_place_dot_on_sphere(dot, new_dir)
+		"gather":
+			print("TODO: gather — needs resource system")
+		"build_upward":
+			print("TODO: build — needs surface marking system")
+		"mark_surface":
+			print("TODO: mark_surface — needs surface marking system")
+		"face_target":
+			print("TODO: face_target — needs target system")
+
+func _colony_center() -> Vector3:
 	var center = Vector3.ZERO
 	for dot in dots:
 		center += dot.position.normalized()
 	if dots.size() > 0:
 		center = (center / dots.size()).normalized()
+	return center
+
+# --- Camera ---
+
+func _focus_on_colony():
+	var center = _colony_center()
 	orbit_yaw = atan2(center.x, center.z)
 	orbit_pitch = asin(clamp(center.y, -1.0, 1.0))
 
@@ -119,6 +340,8 @@ func _update_camera():
 	var z = zoom_distance * cos(pitch_clamped) * cos(orbit_yaw)
 	camera.position = Vector3(x, y, z)
 	camera.look_at(Vector3.ZERO, Vector3.UP)
+
+# --- Input ---
 
 func _input(event):
 	if event is InputEventMouseButton:
@@ -166,70 +389,27 @@ func _input(event):
 func _zoom(delta: float):
 	zoom_target = clamp(zoom_target + delta, ZOOM_MIN, ZOOM_MAX)
 
-func _process_input(text: String):
-	if USE_SERVER:
-		_send_chant_to_server(text)  # TODO: implement when server is ready
-	else:
-		_process_chant_locally(text)
-
-func _send_chant_to_server(_text: String):
-	pass  # HTTP call to server goes here
-
-func _process_chant_locally(text: String):
-	var lower = text.to_lower().strip_edges()
-	var behavior = INTENT_MAP.get(lower, "idle")
-	current_behavior = behavior
-	print("Input: '%s' → Behavior: %s" % [text, behavior])
-	_apply_behavior(behavior)
-
-func _apply_behavior(behavior: String):
-	var current_dots = dots.duplicate()
-	match behavior:
-		"reproduce":
-			for dot in current_dots:
-				_spawn_dot_near(dot)
-		"construct":
-			print("TODO: construct")
-		"explore":
-			for dot in current_dots:
-				_move_dot_randomly(dot)
-		"aggressive":
-			print("TODO: aggressive")
-		"defend":
-			print("TODO: defend")
-		"gather":
-			print("TODO: gather")
-		"idle":
-			print("Idle")
+# --- Dot management ---
 
 func _spawn_player_dot():
 	var angle = randf() * TAU
-	player_dot = _create_dot(Vector3(sin(angle), 0.0, cos(angle)))
+	player_dot = _create_dot(Vector3(sin(angle), 0.0, cos(angle)), null)
 	_focus_on_colony()
 
-func _spawn_dot_near(reference_dot: Node3D):
-	if reference_dot == null:
+func _spawn_dot_near(parent: Node3D):
+	if parent == null:
 		return
-	var dir = reference_dot.position.normalized()
+	var dir = parent.position.normalized()
 	var up = Vector3.UP if abs(dir.dot(Vector3.UP)) < 0.99 else Vector3.FORWARD
 	var tangent = dir.cross(up).normalized()
 	var bitangent = dir.cross(tangent).normalized()
 	var angle = randf() * TAU
 	var nudge = (tangent * cos(angle) + bitangent * sin(angle)) * 0.018
 	var new_dir = (dir + nudge).normalized()
-	_create_dot(new_dir)
+	_create_dot(new_dir, parent)
 	_focus_on_colony()
 
-func _move_dot_randomly(dot: Node3D):
-	if dot == null:
-		return
-	var dir = dot.position.normalized()
-	var tangent = dir.cross(Vector3(randf_range(-1,1), randf_range(-1,1), randf_range(-1,1))).normalized()
-	var nudge_amount = randf_range(0.02, 0.06)
-	var new_dir = (dir + tangent * nudge_amount).normalized()
-	_place_dot_on_sphere(dot, new_dir)
-
-func _create_dot(direction: Vector3) -> Node3D:
+func _create_dot(direction: Vector3, parent) -> Node3D:
 	var dot = MeshInstance3D.new()
 	var box = BoxMesh.new()
 	box.size = Vector3(0.015, 0.006, 0.015)
@@ -243,12 +423,31 @@ func _create_dot(direction: Vector3) -> Node3D:
 	dot.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
 	add_child(dot)
 	dots.append(dot)
-	dot_data[dot] = {
-		"age": 0,
-		"behavior": "idle",
-	}
+
+	# Inherit parent CCE at dilution rate, or start neutral
+	var cce = _deep_copy_cce(NEUTRAL_CCE)
+	if parent != null and dot_data.has(parent):
+		var parent_cce = dot_data[parent]["cce"]
+		for layer in ["motion", "action"]:
+			for key in cce[layer]:
+				cce[layer][key] = parent_cce[layer][key] * CCE_DILUTION
+		for key in cce["dials"]:
+			cce["dials"][key] = parent_cce["dials"][key] * CCE_DILUTION
+
+	dot_data[dot] = { "age": 0, "cce": cce }
 	_place_dot_on_sphere(dot, direction)
 	return dot
+
+func _deep_copy_cce(source: Dictionary) -> Dictionary:
+	var copy = {}
+	for layer in source:
+		if source[layer] is Dictionary:
+			copy[layer] = {}
+			for key in source[layer]:
+				copy[layer][key] = source[layer][key]
+		else:
+			copy[layer] = source[layer]
+	return copy
 
 func _age_dots():
 	var to_remove = []
