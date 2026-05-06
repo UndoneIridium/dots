@@ -214,3 +214,32 @@
 - CCE dilution disabled for ENEMY_COLONY (testing only — re-enable when tuning)
 - HUD shows combined CCE across all colonies — should separate per-colony
 	
+
+---
+
+## Session Notes — 2026-05-06 (cont.)
+
+### Combat System (implemented)
+- `COMBAT_TICKS = 3` — combat resolves after 3 ticks; intensity > 0.7 shortens to 2
+- `combat_clusters` array — each entry: `{pairs: [{attacker, defender}], ticks_remaining}`
+- `combat_locked` dict — dots in combat skip their primitive roll
+- Attack primitive now a deliberate march: detects enemies within `ATTACK_DETECT_RADIUS = 10` cells, steps one cell per tick toward nearest, locks on contact
+- `CELL_STEP` constant defines one grid-cell march distance
+- March uses `_is_foreign_in_exact_cell` (exact cell only) so attacker advances right to the line
+- Wander/defend still use full 8-neighbor `_is_blocked_by_foreign` for separation
+- Cluster timer shared — multiple attackers can pile onto one defender, all resolve together
+- Attacker wins ties; both deleted on mutual combat (MAD)
+- `_remove_dot()` now cleans up combat clusters immediately when a dot is removed mid-combat — prevents zombie locked dots
+- `_apply_recipe()` now filters to LOCAL_COLONY only — chants no longer affect enemy colony
+- TICK_SPEED reduced to 1.0 for testing (was 5.0)
+- `_is_foreign_in_exact_cell(dir, colony)` added — exact cell foreign check for march logic
+
+### Known Issues / TODO
+- Passive tick rate not implemented (server-side concern)
+- gather/build/mark_surface primitives silently do nothing
+- No resource system
+- No surface marking system
+- No multiplayer / server layer
+- CCE dilution disabled for ENEMY_COLONY (testing only)
+- HUD shows combined CCE across all colonies — should separate per-colony
+- Client FPS tanks at ~8k dots — expected, server will own simulation at scale

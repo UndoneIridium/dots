@@ -8,7 +8,7 @@ const PINCH_SPEED = 0.004
 const ZOOM_SMOOTH = 8.0
 const ROTATE_SPEED = 0.005
 
-const TICK_SPEED = 5.0
+const TICK_SPEED = 1.0
 var tick_timer = 0.0
 
 const USE_SERVER = false
@@ -192,6 +192,8 @@ func _check_chant_file():
 func _apply_recipe(recipe: Dictionary):
 	print("Applying recipe: ", recipe)
 	for dot in dots:
+		if dot_data[dot].get("colony", LOCAL_COLONY) != LOCAL_COLONY:
+			continue
 		var cce = dot_data[dot]["cce"]
 		if recipe.has("motion"):
 			for key in recipe["motion"]:
@@ -372,7 +374,7 @@ func _execute_primitive(dot: Node3D, primitive: String, dials: Dictionary):
 				var tangent = my_dir.cross(toward).cross(my_dir).normalized()
 				var new_dir = (my_dir + tangent * step).normalized()
 				# Only move if the cell is not blocked by foreign (respect the line)
-				if not _is_blocked_by_foreign(new_dir, my_colony):
+				if not _is_foreign_in_exact_cell(new_dir, my_colony):
 					_place_dot_on_sphere(dot, new_dir)
 		"defend":
 			var dir = dot.position.normalized()
@@ -421,6 +423,27 @@ func _tick_combat_clusters():
 func _remove_dot(dot: Node3D):
 	if not dot_data.has(dot):
 		return
+	# If dot is in any combat cluster, resolve those pairs immediately
+	for cluster in combat_clusters:
+		for pair in cluster["pairs"]:
+			if pair["attacker"] == dot or pair["defender"] == dot:
+				# The other participant survives — unlock them
+				var survivor = pair["defender"] if pair["attacker"] == dot else pair["attacker"]
+				if is_instance_valid(survivor):
+					combat_locked.erase(survivor)
+	# Remove clusters that are now fully resolved by this removal
+	var to_remove_clusters = []
+	for cluster in combat_clusters:
+		var still_active = false
+		for pair in cluster["pairs"]:
+			if pair["attacker"] != dot and pair["defender"] != dot:
+				if dot_data.has(pair["attacker"]) and dot_data.has(pair["defender"]):
+					still_active = true
+					break
+		if not still_active:
+			to_remove_clusters.append(cluster)
+	for cluster in to_remove_clusters:
+		combat_clusters.erase(cluster)
 	dots.erase(dot)
 	dot_data.erase(dot)
 	combat_locked.erase(dot)
@@ -518,6 +541,18 @@ func _rebuild_spatial_grid():
 func _is_cell_occupied(dir: Vector3) -> bool:
 	var key = _cell_key(dir)
 	return spatial_grid.has(key) and spatial_grid[key].size() > 0
+
+func _is_foreign_in_exact_cell(dir: Vector3, my_colony: int) -> bool:
+	# Only checks the exact destination cell, not neighbors
+	var key = _cell_key(dir)
+	if not spatial_grid.has(key):
+		return false
+	for occupant in spatial_grid[key]:
+		if not is_instance_valid(occupant) or not dot_data.has(occupant):
+			continue
+		if dot_data[occupant]["colony"] != my_colony:
+			return true
+	return false
 
 func _is_blocked_by_foreign(dir: Vector3, my_colony: int) -> bool:
 	var key = _cell_key(dir)
