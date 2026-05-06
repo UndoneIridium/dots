@@ -17,6 +17,11 @@ const CCE_DILUTION = 0.7
 const CHANT_WEIGHT = 0.08  # how much each chant shifts a weight
 const CHANT_FILE = "res://chant.json"
 
+# Spatial grid for foreign dot exclusion
+# Resolution: number of cells per axis on the quantized sphere surface
+const GRID_RES = 200
+var spatial_grid = {}  # cell_key (Vector2i) -> array of dots
+
 # Baseline dial values
 const DIAL_BASELINE = {
 	"range": 0.5,
@@ -69,6 +74,36 @@ var dot_data = {}
 # }
 
 var player_dot = null
+const LOCAL_COLONY = 0
+const ENEMY_COLONY = 1
+
+# Fog of war — revealed colony IDs (colony 0 always sees itself)
+var revealed_colonies = {LOCAL_COLONY: true}
+const FOG_COLOR = Color(0.25, 0.25, 0.25)  # dim grey for unrevealed dots
+const FOG_EMISSION = Color(0.1, 0.1, 0.1)
+
+# Preset CCE for colony 1
+const COLONY1_CCE = {
+	"motion": {
+		"wander": 0.40,
+		"face_target": 0.0,
+	},
+	"action": {
+		"mark_surface": 0.0,
+		"build_upward": 0.0,
+		"gather": 0.0,
+		"defend": 0.0,
+		"attack": 0.40,
+		"reproduce": 0.32
+	},
+	"dials": {
+		"range": 0.5,
+		"intensity": 0.5,
+		"frequency": 1.0,
+		"affinity": 0.0,
+		"spiral": 0.0
+	}
+}
 
 @onready var camera = $Camera3D
 @onready var chant_button = $UI/ChantButton
@@ -77,6 +112,7 @@ var player_dot = null
 @onready var confirm_button = $UI/ChantModal/VBox/ButtonRow/ConfirmButton
 @onready var cancel_button = $UI/ChantModal/VBox/ButtonRow/CancelButton
 @onready var dev_bar = $UI/DevBar
+@onready var hud = $UI/HUD
 
 # Zoom state
 var zoom_target = 3.0
@@ -97,7 +133,9 @@ var single_touch_index = -1
 
 func _ready():
 	_spawn_player_dot()
+	_spawn_enemy_colony()
 	_update_camera()
+	_update_hud()
 	chant_button.pressed.connect(_open_chant)
 	confirm_button.pressed.connect(_confirm_chant)
 	cancel_button.pressed.connect(_close_chant)
@@ -135,6 +173,8 @@ func _process(delta):
 		tick_timer = 0.0
 		_check_chant_file()
 		_age_dots()
+		_rebuild_spatial_grid()
+		_check_fog_of_war()
 		_tick_all_dots()
 
 # --- Chant file (Claude bridge) ---
@@ -181,8 +221,34 @@ func _apply_recipe(recipe: Dictionary):
 			for key in recipe["dials"]:
 				if cce["dials"].has(key):
 					cce["dials"][key] = clamp(cce["dials"][key] + recipe["dials"][key], 0.0, 1.0)
-	_print_avg_cce()
 	_update_all_dot_colors()
+	_update_hud()
+
+func _update_hud():
+	if dots.is_empty():
+		hud.text = "dots: 0"
+		return
+	# Find dominant CCE across colony
+	var totals = {}
+	for dot in dots:
+		var cce = dot_data[dot]["cce"]
+		for key in cce["motion"]:
+			totals[key] = totals.get(key, 0.0) + cce["motion"][key]
+		for key in cce["action"]:
+			totals[key] = totals.get(key, 0.0) + cce["action"][key]
+	# Sort by value descending, pick top 3
+	var sorted_keys = totals.keys()
+	sorted_keys.sort_custom(func(a, b): return totals[a] > totals[b])
+	var lines = ["dots: %d" % dots.size()]
+	var shown = 0
+	for key in sorted_keys:
+		var avg = totals[key] / dots.size()
+		if avg > 0.001:
+			lines.append("%s  %.2f" % [key, avg])
+			shown += 1
+			if shown >= 3:
+				break
+	hud.text = "\n".join(lines)
 
 func _print_avg_cce():
 	if dots.is_empty():
@@ -328,22 +394,30 @@ func _execute_primitive(dot: Node3D, primitive: String, dials: Dictionary):
 			else:
 				tangent = dir.cross(Vector3(randf_range(-1,1), randf_range(-1,1), randf_range(-1,1))).normalized()
 			var new_dir = (dir + tangent * nudge_amount).normalized()
-			_place_dot_on_sphere(dot, new_dir)
+			_place_dot_on_sphere(dot, new_dir, true)
 		"reproduce":
 			var chance = lerp(0.1, 0.9, intensity)
 			if randf() < chance:
-				_spawn_dot_near(dot)
+				_spawn_dot_near(dot, dot_data[dot].get("colony", LOCAL_COLONY))
 		"defend":
 			var dir = dot.position.normalized()
 			var center = _colony_center()
 			var toward = (center - dir).normalized()
 			var new_dir = (dir + toward * 0.01).normalized()
-			_place_dot_on_sphere(dot, new_dir)
+			_place_dot_on_sphere(dot, new_dir, true)
 
 func _update_dot_color(dot: Node3D):
+	var colony = dot_data[dot].get("colony", LOCAL_COLONY)
+	var mat = dot.material_override as StandardMaterial3D
+	if not mat:
+		return
+	# Fog of war — unrevealed foreign colonies render as dim grey
+	if not revealed_colonies.get(colony, false):
+		mat.albedo_color = FOG_COLOR
+		mat.emission = FOG_EMISSION
+		return
 	var cce = dot_data[dot]["cce"]
-	# Gather all weighted CCE color contributions
-	var color = CCE_NEUTRAL_COLOR
+	# Gather weighted CCE color contributions
 	var total = 0.0
 	var weighted = Color(0, 0, 0, 0)
 	for key in CCE_COLORS:
@@ -357,12 +431,15 @@ func _update_dot_color(dot: Node3D):
 			weighted.g += CCE_COLORS[key].g * weight
 			weighted.b += CCE_COLORS[key].b * weight
 			total += weight
+	# Lerp toward white based on total CCE magnitude — diluted children wash out
+	const MAX_CCE_FOR_SATURATION = 1.5
+	var saturation = clamp(total / MAX_CCE_FOR_SATURATION, 0.0, 1.0)
+	var hue_color = CCE_NEUTRAL_COLOR
 	if total > 0.0:
-		color = Color(weighted.r / total, weighted.g / total, weighted.b / total)
-	var mat = dot.material_override as StandardMaterial3D
-	if mat:
-		mat.albedo_color = color
-		mat.emission = color
+		hue_color = Color(weighted.r / total, weighted.g / total, weighted.b / total)
+	var color = CCE_NEUTRAL_COLOR.lerp(hue_color, saturation)
+	mat.albedo_color = color
+	mat.emission = color
 
 func _update_all_dot_colors():
 	for dot in dots:
@@ -443,10 +520,18 @@ func _zoom(delta: float):
 
 func _spawn_player_dot():
 	var angle = randf() * TAU
-	player_dot = _create_dot(Vector3(sin(angle), 0.0, cos(angle)), null)
+	player_dot = _create_dot(Vector3(sin(angle), 0.0, cos(angle)), null, LOCAL_COLONY)
 	_focus_on_colony()
 
-func _spawn_dot_near(parent: Node3D):
+func _spawn_enemy_colony():
+	# Spawn 90 degrees away from player on the equator
+	var player_dir = player_dot.position.normalized()
+	var up = Vector3.UP if abs(player_dir.dot(Vector3.UP)) < 0.99 else Vector3.FORWARD
+	var perp = player_dir.cross(up).normalized()
+	var enemy_dir = (player_dir * cos(PI / 4.0) + perp * sin(PI / 4.0)).normalized()
+	_create_dot(enemy_dir, null, ENEMY_COLONY, COLONY1_CCE)
+
+func _spawn_dot_near(parent: Node3D, colony: int = LOCAL_COLONY):
 	if parent == null:
 		return
 	var dir = parent.position.normalized()
@@ -456,9 +541,11 @@ func _spawn_dot_near(parent: Node3D):
 	var angle = randf() * TAU
 	var nudge = (tangent * cos(angle) + bitangent * sin(angle)) * 0.018
 	var new_dir = (dir + nudge).normalized()
-	_create_dot(new_dir, parent)
+	var my_colony = dot_data[parent].get("colony", colony)
+	if not _is_cell_occupied(new_dir) and not _is_blocked_by_foreign(new_dir, my_colony):
+		_create_dot(new_dir, parent, my_colony)
 
-func _create_dot(direction: Vector3, parent) -> Node3D:
+func _create_dot(direction: Vector3, parent, colony: int = LOCAL_COLONY, preset_cce: Dictionary = {}) -> Node3D:
 	var dot = MeshInstance3D.new()
 	var box = BoxMesh.new()
 	box.size = Vector3(0.015, 0.006, 0.015)
@@ -473,17 +560,20 @@ func _create_dot(direction: Vector3, parent) -> Node3D:
 	add_child(dot)
 	dots.append(dot)
 
-	# Inherit parent CCE at dilution rate, or start neutral
+	# Inherit parent CCE at dilution rate, use preset, or start neutral
 	var cce = _deep_copy_cce(NEUTRAL_CCE)
-	if parent != null and dot_data.has(parent):
+	if not preset_cce.is_empty():
+		cce = _deep_copy_cce(preset_cce)
+	elif parent != null and dot_data.has(parent):
 		var parent_cce = dot_data[parent]["cce"]
+		var dilution = 1.0 if colony == ENEMY_COLONY else CCE_DILUTION
 		for layer in ["motion", "action"]:
 			for key in cce[layer]:
-				cce[layer][key] = parent_cce[layer][key] * CCE_DILUTION
+				cce[layer][key] = parent_cce[layer][key] * dilution
 		for key in cce["dials"]:
-			cce["dials"][key] = parent_cce["dials"][key] * CCE_DILUTION
+			cce["dials"][key] = parent_cce["dials"][key] * dilution
 
-	dot_data[dot] = { "age": 0, "cce": cce }
+	dot_data[dot] = { "age": 0, "cce": cce, "colony": colony }
 	_place_dot_on_sphere(dot, direction)
 	_update_dot_color(dot)
 	return dot
@@ -499,6 +589,61 @@ func _deep_copy_cce(source: Dictionary) -> Dictionary:
 			copy[layer] = source[layer]
 	return copy
 
+# --- Fog of war ---
+
+func _check_fog_of_war():
+	# Reveal a colony when any of its dots are adjacent to any local colony dot
+	for dot in dots:
+		if dot_data[dot]["colony"] == LOCAL_COLONY:
+			continue
+		var colony = dot_data[dot]["colony"]
+		if revealed_colonies.get(colony, false):
+			continue
+		# Check if this foreign dot has a local dot as neighbor
+		var key = _cell_key(dot.position.normalized())
+		for du in [-1, 0, 1]:
+			for dv in [-1, 0, 1]:
+				var neighbor = Vector2i((key.x + du) % GRID_RES, (key.y + dv) % GRID_RES)
+				if spatial_grid.has(neighbor):
+					for occupant in spatial_grid[neighbor]:
+						if dot_data[occupant]["colony"] == LOCAL_COLONY:
+							revealed_colonies[colony] = true
+							print("Colony %d revealed!" % colony)
+							_update_all_dot_colors()
+							return
+
+# --- Spatial grid ---
+
+func _cell_key(dir: Vector3) -> Vector2i:
+	# Project direction onto sphere and quantize to grid cell
+	var d = dir.normalized()
+	var u = int((atan2(d.x, d.z) / TAU + 0.5) * GRID_RES) % GRID_RES
+	var v = int((asin(clamp(d.y, -1.0, 1.0)) / PI + 0.5) * GRID_RES) % GRID_RES
+	return Vector2i(u, v)
+
+func _rebuild_spatial_grid():
+	spatial_grid.clear()
+	for dot in dots:
+		var key = _cell_key(dot.position.normalized())
+		if not spatial_grid.has(key):
+			spatial_grid[key] = []
+		spatial_grid[key].append(dot)
+
+func _is_cell_occupied(dir: Vector3) -> bool:
+	var key = _cell_key(dir)
+	return spatial_grid.has(key) and spatial_grid[key].size() > 0
+
+func _is_blocked_by_foreign(dir: Vector3, my_colony: int) -> bool:
+	var key = _cell_key(dir)
+	for du in [-1, 0, 1]:
+		for dv in [-1, 0, 1]:
+			var neighbor = Vector2i((key.x + du) % GRID_RES, (key.y + dv) % GRID_RES)
+			if spatial_grid.has(neighbor):
+				for occupant in spatial_grid[neighbor]:
+					if dot_data[occupant]["colony"] != my_colony:
+						return true
+	return false
+
 func _age_dots():
 	var to_remove = []
 	for dot in dots:
@@ -512,7 +657,11 @@ func _age_dots():
 			player_dot = dots[0] if dots.size() > 0 else null
 		dot.queue_free()
 
-func _place_dot_on_sphere(dot: Node3D, direction: Vector3):
+func _place_dot_on_sphere(dot: Node3D, direction: Vector3, check_foreign: bool = false) -> bool:
+	if check_foreign:
+		var my_colony = dot_data[dot].get("colony", LOCAL_COLONY)
+		if _is_blocked_by_foreign(direction, my_colony):
+			return false
 	var dir = direction.normalized()
 	dot.position = dir * (SPHERE_RADIUS + 0.0075)
 	var new_basis = Basis()
@@ -520,3 +669,4 @@ func _place_dot_on_sphere(dot: Node3D, direction: Vector3):
 	new_basis.x = new_basis.y.cross(Vector3.FORWARD if abs(dir.dot(Vector3.FORWARD)) < 0.99 else Vector3.RIGHT).normalized()
 	new_basis.z = new_basis.x.cross(new_basis.y).normalized()
 	dot.transform.basis = new_basis
+	return true

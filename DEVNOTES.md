@@ -156,4 +156,61 @@
 	- No multiplayer / server layer
 	- Foreign dot rendering stubbed but not wired
 	- Population cap not implemented (reproduce will grow unbounded)
+
+---
+
+## Session Notes — 2026-05-06
+
+### HUD
+- Added `UI/HUD` Label node (top-left, always visible)
+- Shows dot count and top 3 dominant CCE behaviors averaged across all dots
+- Updates on chant apply and once at startup
+
+### Spatial Grid (foreign dot exclusion)
+- `spatial_grid`: Dictionary mapping `Vector2i` cell keys → `Array` of dots
+- `GRID_RES = 200` (cells per axis, tunable)
+- `_cell_key(dir)` quantizes a sphere direction to a grid coordinate
+- `_rebuild_spatial_grid()` called once per tick after aging
+- `_is_blocked_by_foreign(dir, colony)` — blocks movement/spawn into cells occupied by a different colony
+- `_get_foreign_dots_near(dir, colony)` — returns all foreign dots in cell + 8 neighbors (ready for combat)
+- `_is_cell_occupied(dir)` — checks exact cell only; blocks same-colony spawn stacking
+- Spawn now requires target cell to be empty (any colony) — prevents FPS tank from dot stacking
+- Naturally caps reproduce-heavy colonies at area saturation; must wander to expand
+- Scales well for client-side prototype; server will own territory logic at scale
+
+### Colony 1 (enemy test colony)
+- Spawns 45° from colony 0 on the equator
+- Preset CCE: attack 0.40, wander 0.40, reproduce 0.32
+- `ENEMY_COLONY = 1` constant; colony ID stored in `dot_data[dot]["colony"]`
+- Children inherit full CCE (no dilution) for testing — revert via `CCE_DILUTION` flag when ready
+- `_create_dot()` now accepts `colony` and `preset_cce` params
+
+### Fog of War
+- Foreign colonies render as dim grey (0.25, 0.25, 0.25) until contact with colony 0
+- `revealed_colonies` dictionary; colony 0 always revealed
+- `_check_fog_of_war()` runs each tick after grid rebuild
+- On first contact, colony is permanently revealed and all dot colors update
+- Per-colony revelation (not per-dot)
+
+### CCE Color Magnitude
+- Color now lerps from white toward hue based on total CCE weight sum
+- `MAX_CCE_FOR_SATURATION = 1.5` — dots with low total CCE appear washed out
+- Diluted children correctly appear less saturated than parents
+
+### Combat Design (decided, not yet implemented)
+- Probabilistic: attacker rolls `attack` primitive, finds foreign dot via grid
+- Combat power = attack CCE + defend CCE for each dot
+- Higher total wins; ties go to attacker
+- Both dots deleted if mutual attack resolves same tick (MAD)
+- Pending deletions list processed after all primitives resolve
+- attack primitive still a no-op pending implementation
+
+### Known Issues / TODO
+- Passive tick rate not implemented (server-side concern)
+- attack/gather/build/mark_surface primitives silently do nothing (combat designed, not wired)
+- No resource system
+- No surface marking system
+- No multiplayer / server layer
+- CCE dilution disabled for ENEMY_COLONY (testing only — re-enable when tuning)
+- HUD shows combined CCE across all colonies — should separate per-colony
 	
