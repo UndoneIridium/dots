@@ -56,6 +56,8 @@ const CCE_COLORS = {
 	"attack": Color(1.0, 0.2, 0.2),     # red
 }
 const CCE_NEUTRAL_COLOR = Color(1.0, 1.0, 1.0)  # white
+
+var dots = []
 var dot_data = {}
 # dot_data[dot] = {
 #   "age": int,
@@ -513,8 +515,8 @@ func _age_dots():
 func _place_dot_on_sphere(dot: Node3D, direction: Vector3):
 	var dir = direction.normalized()
 	dot.position = dir * (SPHERE_RADIUS + 0.0075)
-	var basis = Basis()
-	basis.y = dir
-	basis.x = basis.y.cross(Vector3.FORWARD if abs(dir.dot(Vector3.FORWARD)) < 0.99 else Vector3.RIGHT).normalized()
-	basis.z = basis.x.cross(basis.y).normalized()
-	dot.transform.basis = basis
+	var new_basis = Basis()
+	new_basis.y = dir
+	new_basis.x = new_basis.y.cross(Vector3.FORWARD if abs(dir.dot(Vector3.FORWARD)) < 0.99 else Vector3.RIGHT).normalized()
+	new_basis.z = new_basis.x.cross(new_basis.y).normalized()
+	dot.transform.basis = new_basis

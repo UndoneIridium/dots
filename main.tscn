@@ -6,7 +6,8 @@
 radius = 1.0
 height = 2.0
 
-[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_h2yge"]
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_ig7tw"]
+albedo_color = Color(0.72156864, 0.72156864, 0.72156864, 1)
 roughness = 0.8
 
 [sub_resource type="SphereShape3D" id="SphereShape3D_ig7tw"]
@@ -23,7 +24,7 @@ script = ExtResource("1_ig7tw")
 
 [node name="WorldSphere" type="MeshInstance3D" parent="." unique_id=286303555]
 mesh = SubResource("SphereMesh_0xm2m")
-surface_material_override/0 = SubResource("StandardMaterial3D_h2yge")
+surface_material_override/0 = SubResource("StandardMaterial3D_ig7tw")
 
 [node name="Camera3D" type="Camera3D" parent="." unique_id=641466361]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 3)
