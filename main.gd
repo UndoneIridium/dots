@@ -48,7 +48,14 @@ const NEUTRAL_CCE = {
 	}
 }
 
-var dots = []
+# CCE color palette
+const CCE_COLORS = {
+	"wander": Color(1.0, 0.75, 0.1),    # amber
+	"reproduce": Color(0.3, 0.9, 0.3),  # green
+	"defend": Color(0.2, 0.5, 1.0),     # blue
+	"attack": Color(1.0, 0.2, 0.2),     # red
+}
+const CCE_NEUTRAL_COLOR = Color(1.0, 1.0, 1.0)  # white
 var dot_data = {}
 # dot_data[dot] = {
 #   "age": int,
@@ -172,6 +179,45 @@ func _apply_recipe(recipe: Dictionary):
 			for key in recipe["dials"]:
 				if cce["dials"].has(key):
 					cce["dials"][key] = clamp(cce["dials"][key] + recipe["dials"][key], 0.0, 1.0)
+	_print_avg_cce()
+	_update_all_dot_colors()
+
+func _print_avg_cce():
+	if dots.is_empty():
+		return
+	var avg = _deep_copy_cce(NEUTRAL_CCE)
+	for dot in dots:
+		var cce = dot_data[dot]["cce"]
+		for key in cce["motion"]:
+			avg["motion"][key] += cce["motion"][key]
+		for key in cce["action"]:
+			avg["action"][key] += cce["action"][key]
+		for key in cce["dials"]:
+			avg["dials"][key] += cce["dials"][key]
+	var n = float(dots.size())
+	var lines = ["--- Colony CCE avg (%d dots) ---" % dots.size()]
+	var motion_parts = []
+	for key in avg["motion"]:
+		var val = avg["motion"][key] / n
+		if val > 0.001:
+			motion_parts.append("%s: %.3f" % [key, val])
+	if motion_parts.size() > 0:
+		lines.append("motion:  " + ", ".join(motion_parts))
+	var action_parts = []
+	for key in avg["action"]:
+		var val = avg["action"][key] / n
+		if val > 0.001:
+			action_parts.append("%s: %.3f" % [key, val])
+	if action_parts.size() > 0:
+		lines.append("action:  " + ", ".join(action_parts))
+	var dial_parts = []
+	for key in avg["dials"]:
+		var val = avg["dials"][key] / n
+		if abs(val - DIAL_BASELINE.get(key, 0.5)) > 0.01:
+			dial_parts.append("%s: %.3f" % [key, val])
+	if dial_parts.size() > 0:
+		lines.append("dials:   " + ", ".join(dial_parts))
+	print("\n".join(lines))
 
 # --- In-game chant (local fallback while testing) ---
 
@@ -292,6 +338,34 @@ func _execute_primitive(dot: Node3D, primitive: String, dials: Dictionary):
 			var new_dir = (dir + toward * 0.01).normalized()
 			_place_dot_on_sphere(dot, new_dir)
 
+func _update_dot_color(dot: Node3D):
+	var cce = dot_data[dot]["cce"]
+	# Gather all weighted CCE color contributions
+	var color = CCE_NEUTRAL_COLOR
+	var total = 0.0
+	var weighted = Color(0, 0, 0, 0)
+	for key in CCE_COLORS:
+		var weight = 0.0
+		if cce["motion"].has(key):
+			weight = cce["motion"][key]
+		elif cce["action"].has(key):
+			weight = cce["action"][key]
+		if weight > 0.0:
+			weighted.r += CCE_COLORS[key].r * weight
+			weighted.g += CCE_COLORS[key].g * weight
+			weighted.b += CCE_COLORS[key].b * weight
+			total += weight
+	if total > 0.0:
+		color = Color(weighted.r / total, weighted.g / total, weighted.b / total)
+	var mat = dot.material_override as StandardMaterial3D
+	if mat:
+		mat.albedo_color = color
+		mat.emission = color
+
+func _update_all_dot_colors():
+	for dot in dots:
+		_update_dot_color(dot)
+
 func _colony_center() -> Vector3:
 	var center = Vector3.ZERO
 	for dot in dots:
@@ -381,7 +455,6 @@ func _spawn_dot_near(parent: Node3D):
 	var nudge = (tangent * cos(angle) + bitangent * sin(angle)) * 0.018
 	var new_dir = (dir + nudge).normalized()
 	_create_dot(new_dir, parent)
-	_focus_on_colony()
 
 func _create_dot(direction: Vector3, parent) -> Node3D:
 	var dot = MeshInstance3D.new()
@@ -410,6 +483,7 @@ func _create_dot(direction: Vector3, parent) -> Node3D:
 
 	dot_data[dot] = { "age": 0, "cce": cce }
 	_place_dot_on_sphere(dot, direction)
+	_update_dot_color(dot)
 	return dot
 
 func _deep_copy_cce(source: Dictionary) -> Dictionary:
