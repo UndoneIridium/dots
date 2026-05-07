@@ -21,30 +21,39 @@ const CHANT_FILE = "res://chant.json"
 const COMBAT_TICKS = 3
 var combat_clusters = []  # [{"pairs": [{"attacker": dot, "defender": dot}], "ticks_remaining": int}]
 var combat_locked = {}    # dot -> true, skips primitive roll while in combat
+var cluster_by_defender = {}  # defender dot -> cluster reference (O(1) lookup)
 
 # Spatial grid
 const GRID_RES = 200
+const CELL_STEP = TAU / float(GRID_RES)  # one grid cell width in radians
 var spatial_grid = {}  # cell_key (Vector2i) -> array of dots
+var dot_cell = {}      # dot -> current cell_key, for incremental grid updates
 
-# Attack detection radius in grid cells
-const ATTACK_DETECT_RADIUS = 10
+# Attack
+const ATTACK_DETECT_RADIUS = 10  # in grid cells
 
-const DIAL_BASELINE = {
-	"range": 0.5,
-	"intensity": 0.5,
-	"frequency": 1.0,
-	"affinity": 0.0
-}
+# Per-colony population cap (testing aid)
+const MAX_POPULATION_PER_COLONY = 1000
+var colony_counts = {}  # colony_id -> current dot count
+
+# Tuning constants (formerly magic numbers)
+const SPAWN_NUDGE = 0.018
+const DEFEND_STEP = 0.01
+const DOT_SURFACE_OFFSET = 0.0075
+const PARALLEL_EPSILON = 0.0001
+const MAX_CCE_FOR_SATURATION = 1.5
 
 const NEUTRAL_CCE = {
 	"motion": {
 		"wander": 0.0,
-		"face_target": 0.0,
+		# "face_target": reserved \u2014 not yet wired
 	},
 	"action": {
+		# Reserved primitives \u2014 not yet wired, kept for forward compatibility
 		"mark_surface": 0.0,
 		"build_upward": 0.0,
 		"gather": 0.0,
+		# Active primitives
 		"defend": 0.0,
 		"attack": 0.0,
 		"reproduce": 0.0
@@ -52,8 +61,7 @@ const NEUTRAL_CCE = {
 	"dials": {
 		"range": 0.5,
 		"intensity": 0.5,
-		"frequency": 1.0,
-		"affinity": 0.0,
+		# "frequency", "affinity": reserved \u2014 not yet read by any primitive
 		"spiral": 0.0
 	}
 }
@@ -66,21 +74,57 @@ const CCE_COLORS = {
 }
 const CCE_NEUTRAL_COLOR = Color(1.0, 1.0, 1.0)
 
+# Active chant aliases. Dead primitives (gather/build/mark) intentionally absent
+# until their execution paths exist.
+const CHANT_RECIPES = {
+	"wander":    { "motion": { "wander": CHANT_WEIGHT }, "dials": { "range": 0.05 } },
+	"explore":   { "motion": { "wander": CHANT_WEIGHT }, "dials": { "range": 0.05 } },
+	"roam":      { "motion": { "wander": CHANT_WEIGHT }, "dials": { "range": 0.05 } },
+	"spiral":    { "dials": { "spiral": 0.1 } },
+	"reproduce": { "action": { "reproduce": CHANT_WEIGHT } },
+	"multiply":  { "action": { "reproduce": CHANT_WEIGHT } },
+	"sex":       { "action": { "reproduce": CHANT_WEIGHT } },
+	"breed":     { "action": { "reproduce": CHANT_WEIGHT } },
+	"attack":    { "action": { "attack": CHANT_WEIGHT }, "dials": { "intensity": 0.05 } },
+	"fight":     { "action": { "attack": CHANT_WEIGHT }, "dials": { "intensity": 0.05 } },
+	"war":       { "action": { "attack": CHANT_WEIGHT }, "dials": { "intensity": 0.05 } },
+	"defend":    { "action": { "defend": CHANT_WEIGHT } },
+	"protect":   { "action": { "defend": CHANT_WEIGHT } },
+	"guard":     { "action": { "defend": CHANT_WEIGHT } },
+	"far":       { "dials": { "range": 0.1 } },
+	"farther":   { "dials": { "range": 0.1 } },
+	"distant":   { "dials": { "range": 0.1 } },
+	"close":     { "dials": { "range": -0.1 } },
+	"near":      { "dials": { "range": -0.1 } },
+	"tight":     { "dials": { "range": -0.1 } },
+	"fierce":    { "dials": { "intensity": 0.1 } },
+	"sharp":     { "dials": { "intensity": 0.1 } },
+	"strong":    { "dials": { "intensity": 0.1 } },
+	"gentle":    { "dials": { "intensity": -0.1 } },
+	"soft":      { "dials": { "intensity": -0.1 } },
+	"slow":      { "dials": { "intensity": -0.1 } }
+}
+
 var dots = []
 var dot_data = {}
+# dot_data[dot] = {
+#   "age": int,           # ticks lived, dies at DOT_LIFETIME
+#   "colony": int,        # colony ID
+#   "cce": { "motion": {...}, "action": {...}, "dials": {...} }
+# }
 
 var player_dot = null
 const LOCAL_COLONY = 0
 const ENEMY_COLONY = 1
 
 var revealed_colonies = {LOCAL_COLONY: true}
+var known_colonies = {LOCAL_COLONY: true}  # tracks all spawned colony IDs for fog early-exit
 const FOG_COLOR = Color(0.25, 0.25, 0.25)
 const FOG_EMISSION = Color(0.1, 0.1, 0.1)
 
 const COLONY1_CCE = {
 	"motion": {
 		"wander": 0.40,
-		"face_target": 0.0,
 	},
 	"action": {
 		"mark_surface": 0.0,
@@ -93,8 +137,25 @@ const COLONY1_CCE = {
 	"dials": {
 		"range": 0.5,
 		"intensity": 0.5,
-		"frequency": 1.0,
-		"affinity": 0.0,
+		"spiral": 0.0
+	}
+}
+
+const COLONY0_CCE = {
+	"motion": {
+		"wander": 0.40,
+	},
+	"action": {
+		"mark_surface": 0.0,
+		"build_upward": 0.0,
+		"gather": 0.0,
+		"defend": 0.0,
+		"attack": 0.30,
+		"reproduce": 0.32
+	},
+	"dials": {
+		"range": 0.5,
+		"intensity": 0.5,
 		"spiral": 0.0
 	}
 }
@@ -117,6 +178,9 @@ var touch_positions = {}
 var pinch_last_distance = 0.0
 var single_touch_active = false
 var single_touch_index = -1
+
+# Cached per-tick colony center (colony 0 only)
+var _cached_colony_center = Vector3.ZERO
 
 func _ready():
 	_spawn_player_dot()
@@ -160,10 +224,12 @@ func _process(delta):
 		tick_timer = 0.0
 		_check_chant_file()
 		_age_dots()
-		_rebuild_spatial_grid()
+		# Spatial grid is now incrementally maintained \u2014 no rebuild needed
+		_cached_colony_center = _compute_colony_center(LOCAL_COLONY)
 		_check_fog_of_war()
 		_tick_combat_clusters()
 		_tick_all_dots()
+		_update_hud()
 
 # --- Chant file ---
 
@@ -192,7 +258,7 @@ func _check_chant_file():
 func _apply_recipe(recipe: Dictionary):
 	print("Applying recipe: ", recipe)
 	for dot in dots:
-		if dot_data[dot].get("colony", LOCAL_COLONY) != LOCAL_COLONY:
+		if dot_data[dot]["colony"] != LOCAL_COLONY:
 			continue
 		var cce = dot_data[dot]["cce"]
 		if recipe.has("motion"):
@@ -207,7 +273,7 @@ func _apply_recipe(recipe: Dictionary):
 			for key in recipe["dials"]:
 				if cce["dials"].has(key):
 					cce["dials"][key] = clamp(cce["dials"][key] + recipe["dials"][key], 0.0, 1.0)
-	_update_all_dot_colors()
+		_update_dot_color(dot)
 	_update_hud()
 
 func _update_hud():
@@ -215,18 +281,26 @@ func _update_hud():
 		hud.text = "dots: 0"
 		return
 	var totals = {}
+	var count = 0
 	for dot in dots:
+		if dot_data[dot]["colony"] != LOCAL_COLONY:
+			continue
+		count += 1
 		var cce = dot_data[dot]["cce"]
 		for key in cce["motion"]:
 			totals[key] = totals.get(key, 0.0) + cce["motion"][key]
 		for key in cce["action"]:
 			totals[key] = totals.get(key, 0.0) + cce["action"][key]
+	if count == 0:
+		hud.text = "p0: 0 (wiped out)"
+		return
 	var sorted_keys = totals.keys()
 	sorted_keys.sort_custom(func(a, b): return totals[a] > totals[b])
-	var lines = ["dots: %d" % dots.size()]
+	var p1_count = colony_counts.get(ENEMY_COLONY, 0)
+	var lines = ["p0: %d   p1: %d" % [count, p1_count]]
 	var shown = 0
 	for key in sorted_keys:
-		var avg = totals[key] / dots.size()
+		var avg = totals[key] / count
 		if avg > 0.001:
 			lines.append("%s  %.2f" % [key, avg])
 			shown += 1
@@ -234,10 +308,11 @@ func _update_hud():
 				break
 	hud.text = "\n".join(lines)
 
-# --- In-game chant ---
+# --- Chant input ---
 
 func _process_input(text: String):
 	if USE_SERVER:
+		push_warning("USE_SERVER enabled but server is not implemented")
 		_send_chant_to_server(text)
 	else:
 		_process_chant_locally(text)
@@ -247,40 +322,10 @@ func _send_chant_to_server(_text: String):
 
 func _process_chant_locally(text: String):
 	var lower = text.to_lower().strip_edges()
-	var recipe = _local_recipe(lower)
-	if recipe.is_empty():
+	if not CHANT_RECIPES.has(lower):
 		print("No local recipe for: ", text)
 		return
-	_apply_recipe(recipe)
-
-func _local_recipe(word: String) -> Dictionary:
-	match word:
-		"wander", "explore", "roam":
-			return { "motion": { "wander": CHANT_WEIGHT }, "dials": { "range": 0.05 } }
-		"spiral":
-			return { "dials": { "spiral": 0.1 } }
-		"reproduce", "multiply", "sex", "breed":
-			return { "action": { "reproduce": CHANT_WEIGHT } }
-		"attack", "fight", "war":
-			return { "action": { "attack": CHANT_WEIGHT }, "dials": { "intensity": 0.05 } }
-		"defend", "protect", "guard":
-			return { "action": { "defend": CHANT_WEIGHT } }
-		"gather", "collect", "harvest":
-			return { "action": { "gather": CHANT_WEIGHT } }
-		"build", "construct":
-			return { "action": { "build_upward": CHANT_WEIGHT } }
-		"mark", "paint":
-			return { "action": { "mark_surface": CHANT_WEIGHT } }
-		"far", "farther", "distant":
-			return { "dials": { "range": 0.1 } }
-		"close", "near", "tight":
-			return { "dials": { "range": -0.1 } }
-		"fierce", "sharp", "strong":
-			return { "dials": { "intensity": 0.1 } }
-		"gentle", "soft", "slow":
-			return { "dials": { "intensity": -0.1 } }
-		_:
-			return {}
+	_apply_recipe(CHANT_RECIPES[lower])
 
 # --- Per-dot CCE tick ---
 
@@ -337,114 +382,139 @@ func _execute_primitive(dot: Node3D, primitive: String, dials: Dictionary):
 		"reproduce":
 			var chance = lerp(0.1, 0.9, intensity)
 			if randf() < chance:
-				_spawn_dot_near(dot, dot_data[dot].get("colony", LOCAL_COLONY))
+				_spawn_dot_near(dot, dot_data[dot]["colony"])
 		"attack":
-			var my_colony = dot_data[dot].get("colony", LOCAL_COLONY)
-			# Only act if a foreign dot is within detection radius
-			var target = _find_nearest_foreign_in_radius(dot.position.normalized(), my_colony, ATTACK_DETECT_RADIUS)
-			if target == null:
-				return
-			if combat_locked.has(dot) or combat_locked.has(target):
-				return
-			# Check if already adjacent — if so, lock and start combat
-			var foreign_nearby = _get_foreign_dots_near(dot.position.normalized(), my_colony)
-			if target in foreign_nearby:
-				# Adjacent — lock both and initiate combat
-				combat_locked[dot] = true
-				combat_locked[target] = true
-				var ticks = COMBAT_TICKS - (1 if intensity > 0.7 else 0)
-				var joined = false
-				for cluster in combat_clusters:
-					for pair in cluster["pairs"]:
-						if pair["defender"] == target:
-							cluster["pairs"].append({"attacker": dot, "defender": target})
-							joined = true
-							break
-					if joined:
-						break
-				if not joined:
-					combat_clusters.append({"pairs": [{"attacker": dot, "defender": target}], "ticks_remaining": ticks})
-			else:
-				# Not yet adjacent — march one cell toward target
-				var my_dir = dot.position.normalized()
-				var target_dir = target.position.normalized()
-				# One cell step = nudge by 1/GRID_RES of the sphere
-				var step = (1.0 / GRID_RES) * 2.0 * PI
-				var toward = (target_dir - my_dir).normalized()
-				var tangent = my_dir.cross(toward).cross(my_dir).normalized()
-				var new_dir = (my_dir + tangent * step).normalized()
-				# Only move if the cell is not blocked by foreign (respect the line)
-				if not _is_foreign_in_exact_cell(new_dir, my_colony):
-					_place_dot_on_sphere(dot, new_dir)
+			_execute_attack(dot, intensity)
 		"defend":
 			var dir = dot.position.normalized()
-			var center = _colony_center()
-			var toward = (center - dir).normalized()
-			var new_dir = (dir + toward * 0.01).normalized()
+			var toward = (_cached_colony_center - dir).normalized()
+			var new_dir = (dir + toward * DEFEND_STEP).normalized()
 			_place_dot_on_sphere(dot, new_dir, true)
+		# gather, build_upward, mark_surface, face_target: reserved \u2014 no-op
+
+func _execute_attack(dot: Node3D, intensity: float):
+	var my_colony = dot_data[dot]["colony"]
+	var my_dir = dot.position.normalized()
+	var target = _find_nearest_foreign_in_radius(my_dir, my_colony, ATTACK_DETECT_RADIUS)
+	if target == null:
+		return
+	if combat_locked.has(dot) or combat_locked.has(target):
+		return
+	var foreign_nearby = _get_foreign_dots_near(my_dir, my_colony)
+	if target in foreign_nearby:
+		_initiate_combat(dot, target, intensity)
+	else:
+		_march_toward(dot, my_dir, target, my_colony)
+
+func _initiate_combat(attacker: Node3D, defender: Node3D, intensity: float):
+	combat_locked[attacker] = true
+	combat_locked[defender] = true
+	var ticks = COMBAT_TICKS - (1 if intensity > 0.7 else 0)
+	# O(1) lookup: does this defender already have a cluster?
+	if cluster_by_defender.has(defender):
+		var cluster = cluster_by_defender[defender]
+		cluster["pairs"].append({"attacker": attacker, "defender": defender})
+	else:
+		var cluster = {"pairs": [{"attacker": attacker, "defender": defender}], "ticks_remaining": ticks}
+		combat_clusters.append(cluster)
+		cluster_by_defender[defender] = cluster
+
+func _march_toward(dot: Node3D, my_dir: Vector3, target: Node3D, my_colony: int):
+	var target_dir = target.position.normalized()
+	var toward = target_dir - my_dir
+	if toward.length_squared() < PARALLEL_EPSILON:
+		return
+	toward = toward.normalized()
+	var tangent = my_dir.cross(toward)
+	if tangent.length_squared() < PARALLEL_EPSILON:
+		return
+	tangent = tangent.cross(my_dir).normalized()
+	var new_dir = (my_dir + tangent * CELL_STEP).normalized()
+	if not _is_foreign_in_exact_cell(new_dir, my_colony):
+		_place_dot_on_sphere(dot, new_dir)
 
 # --- Combat ---
 
 func _tick_combat_clusters():
 	var to_remove_clusters = []
 	var to_delete = {}
+	var to_advance = []
 	for cluster in combat_clusters:
 		cluster["ticks_remaining"] -= 1
 		if cluster["ticks_remaining"] <= 0:
+			# Track which defenders already have a winning attacker claiming their cell
+			var cell_claimed_by = {}
 			for pair in cluster["pairs"]:
 				var attacker = pair["attacker"]
 				var defender = pair["defender"]
-				# Skip freed or already queued dots
-				if not is_instance_valid(attacker) or not is_instance_valid(defender):
-					continue
+				# dot_data.has() is sufficient \u2014 _remove_dot erases it before queue_free
 				if not dot_data.has(attacker) or not dot_data.has(defender):
 					continue
 				if to_delete.has(attacker) or to_delete.has(defender):
 					continue
-				# Resolve: combined attack+defend power, attacker wins ties
 				var a_power = dot_data[attacker]["cce"]["action"].get("attack", 0.0) + dot_data[attacker]["cce"]["action"].get("defend", 0.0)
 				var d_power = dot_data[defender]["cce"]["action"].get("attack", 0.0) + dot_data[defender]["cce"]["action"].get("defend", 0.0)
 				if a_power >= d_power:
 					to_delete[defender] = true
+					# First winning attacker against this defender claims the cell
+					if not cell_claimed_by.has(defender):
+						cell_claimed_by[defender] = attacker
+						to_advance.append({"winner": attacker, "target_dir": defender.position.normalized()})
 				else:
 					to_delete[attacker] = true
-			# Unlock all dots in cluster
 			for pair in cluster["pairs"]:
-				if is_instance_valid(pair["attacker"]):
-					combat_locked.erase(pair["attacker"])
-				if is_instance_valid(pair["defender"]):
-					combat_locked.erase(pair["defender"])
+				combat_locked.erase(pair["attacker"])
+				combat_locked.erase(pair["defender"])
+				cluster_by_defender.erase(pair["defender"])
 			to_remove_clusters.append(cluster)
 	for cluster in to_remove_clusters:
 		combat_clusters.erase(cluster)
 	for dot in to_delete:
 		_remove_dot(dot)
+	# Advance winners into vacated cells
+	for adv in to_advance:
+		var winner = adv["winner"]
+		if dot_data.has(winner):
+			_place_dot_on_sphere(winner, adv["target_dir"])
 
 func _remove_dot(dot: Node3D):
 	if not dot_data.has(dot):
 		return
-	# If dot is in any combat cluster, resolve those pairs immediately
-	for cluster in combat_clusters:
-		for pair in cluster["pairs"]:
-			if pair["attacker"] == dot or pair["defender"] == dot:
-				# The other participant survives — unlock them
-				var survivor = pair["defender"] if pair["attacker"] == dot else pair["attacker"]
-				if is_instance_valid(survivor):
-					combat_locked.erase(survivor)
-	# Remove clusters that are now fully resolved by this removal
+	# Incrementally remove from spatial grid
+	if dot_cell.has(dot):
+		var key = dot_cell[dot]
+		if spatial_grid.has(key):
+			spatial_grid[key].erase(dot)
+			if spatial_grid[key].is_empty():
+				spatial_grid.erase(key)
+		dot_cell.erase(dot)
+	# Resolve combat clusters this dot was in
 	var to_remove_clusters = []
 	for cluster in combat_clusters:
-		var still_active = false
+		var involved = false
 		for pair in cluster["pairs"]:
-			if pair["attacker"] != dot and pair["defender"] != dot:
-				if dot_data.has(pair["attacker"]) and dot_data.has(pair["defender"]):
-					still_active = true
-					break
-		if not still_active:
-			to_remove_clusters.append(cluster)
+			if pair["attacker"] == dot or pair["defender"] == dot:
+				involved = true
+				var survivor = pair["defender"] if pair["attacker"] == dot else pair["attacker"]
+				combat_locked.erase(survivor)
+		if involved:
+			var still_active = false
+			for pair in cluster["pairs"]:
+				if pair["attacker"] != dot and pair["defender"] != dot:
+					if dot_data.has(pair["attacker"]) and dot_data.has(pair["defender"]):
+						still_active = true
+						break
+			if not still_active:
+				# Clean up index for any defenders in this cluster
+				for pair in cluster["pairs"]:
+					if cluster_by_defender.get(pair["defender"]) == cluster:
+						cluster_by_defender.erase(pair["defender"])
+				to_remove_clusters.append(cluster)
 	for cluster in to_remove_clusters:
 		combat_clusters.erase(cluster)
 	dots.erase(dot)
+	var removed_colony = dot_data[dot]["colony"]
+	colony_counts[removed_colony] = max(0, colony_counts.get(removed_colony, 0) - 1)
 	dot_data.erase(dot)
 	combat_locked.erase(dot)
 	if dot == player_dot:
@@ -454,7 +524,7 @@ func _remove_dot(dot: Node3D):
 # --- Color ---
 
 func _update_dot_color(dot: Node3D):
-	var colony = dot_data[dot].get("colony", LOCAL_COLONY)
+	var colony = dot_data[dot]["colony"]
 	var mat = dot.material_override as StandardMaterial3D
 	if not mat:
 		return
@@ -476,7 +546,6 @@ func _update_dot_color(dot: Node3D):
 			weighted.g += CCE_COLORS[key].g * weight
 			weighted.b += CCE_COLORS[key].b * weight
 			total += weight
-	const MAX_CCE_FOR_SATURATION = 1.5
 	var saturation = clamp(total / MAX_CCE_FOR_SATURATION, 0.0, 1.0)
 	var hue_color = CCE_NEUTRAL_COLOR
 	if total > 0.0:
@@ -489,22 +558,28 @@ func _update_all_dot_colors():
 	for dot in dots:
 		_update_dot_color(dot)
 
-func _colony_center() -> Vector3:
+func _compute_colony_center(colony: int) -> Vector3:
 	var center = Vector3.ZERO
+	var count = 0
 	for dot in dots:
-		center += dot.position.normalized()
-	if dots.size() > 0:
-		center = (center / dots.size()).normalized()
-	return center
+		if dot_data[dot]["colony"] == colony:
+			center += dot.position.normalized()
+			count += 1
+	if count > 0:
+		return (center / count).normalized()
+	return Vector3.ZERO
 
 # --- Fog of war ---
 
 func _check_fog_of_war():
+	# Cheap early exit: known set size matches revealed set size
+	if revealed_colonies.size() >= known_colonies.size():
+		return
+	# TESTING: keep ENEMY_COLONY perpetually fogged for visual contrast
+	return
 	for dot in dots:
-		if dot_data[dot]["colony"] == LOCAL_COLONY:
-			continue
 		var colony = dot_data[dot]["colony"]
-		if revealed_colonies.get(colony, false):
+		if colony == LOCAL_COLONY or revealed_colonies.get(colony, false):
 			continue
 		var key = _cell_key(dot.position.normalized())
 		for du in [-1, 0, 1]:
@@ -512,15 +587,13 @@ func _check_fog_of_war():
 				var neighbor = Vector2i((key.x + du) % GRID_RES, (key.y + dv) % GRID_RES)
 				if spatial_grid.has(neighbor):
 					for occupant in spatial_grid[neighbor]:
-						if not is_instance_valid(occupant) or not dot_data.has(occupant):
-							continue
-						if dot_data[occupant]["colony"] == LOCAL_COLONY:
+						if dot_data.has(occupant) and dot_data[occupant]["colony"] == LOCAL_COLONY:
 							revealed_colonies[colony] = true
 							print("Colony %d revealed!" % colony)
 							_update_all_dot_colors()
 							return
 
-# --- Spatial grid ---
+# --- Spatial grid (incrementally maintained) ---
 
 func _cell_key(dir: Vector3) -> Vector2i:
 	var d = dir.normalized()
@@ -528,29 +601,34 @@ func _cell_key(dir: Vector3) -> Vector2i:
 	var v = int((asin(clamp(d.y, -1.0, 1.0)) / PI + 0.5) * GRID_RES) % GRID_RES
 	return Vector2i(u, v)
 
-func _rebuild_spatial_grid():
-	spatial_grid.clear()
-	for dot in dots:
-		if not is_instance_valid(dot):
-			continue
-		var key = _cell_key(dot.position.normalized())
-		if not spatial_grid.has(key):
-			spatial_grid[key] = []
-		spatial_grid[key].append(dot)
+func _grid_insert(dot: Node3D, key: Vector2i):
+	if not spatial_grid.has(key):
+		spatial_grid[key] = []
+	spatial_grid[key].append(dot)
+	dot_cell[dot] = key
+
+func _grid_update_position(dot: Node3D):
+	# Called after a dot moves \u2014 rehomes it in the grid if its cell changed
+	var new_key = _cell_key(dot.position.normalized())
+	var old_key = dot_cell.get(dot, null)
+	if old_key == new_key:
+		return
+	if old_key != null and spatial_grid.has(old_key):
+		spatial_grid[old_key].erase(dot)
+		if spatial_grid[old_key].is_empty():
+			spatial_grid.erase(old_key)
+	_grid_insert(dot, new_key)
 
 func _is_cell_occupied(dir: Vector3) -> bool:
 	var key = _cell_key(dir)
 	return spatial_grid.has(key) and spatial_grid[key].size() > 0
 
 func _is_foreign_in_exact_cell(dir: Vector3, my_colony: int) -> bool:
-	# Only checks the exact destination cell, not neighbors
 	var key = _cell_key(dir)
 	if not spatial_grid.has(key):
 		return false
 	for occupant in spatial_grid[key]:
-		if not is_instance_valid(occupant) or not dot_data.has(occupant):
-			continue
-		if dot_data[occupant]["colony"] != my_colony:
+		if dot_data.has(occupant) and dot_data[occupant]["colony"] != my_colony:
 			return true
 	return false
 
@@ -561,28 +639,22 @@ func _is_blocked_by_foreign(dir: Vector3, my_colony: int) -> bool:
 			var neighbor = Vector2i((key.x + du) % GRID_RES, (key.y + dv) % GRID_RES)
 			if spatial_grid.has(neighbor):
 				for occupant in spatial_grid[neighbor]:
-					if not is_instance_valid(occupant) or not dot_data.has(occupant):
-						continue
-					if dot_data[occupant]["colony"] != my_colony:
+					if dot_data.has(occupant) and dot_data[occupant]["colony"] != my_colony:
 						return true
 	return false
 
 func _find_nearest_foreign_in_radius(dir: Vector3, my_colony: int, radius: int):
-	# Search expanding grid rings up to radius cells away
 	var key = _cell_key(dir)
 	var best = null
 	var best_dist = INF
 	for du in range(-radius, radius + 1):
 		for dv in range(-radius, radius + 1):
-			if abs(du) > radius or abs(dv) > radius:
-				continue
 			var neighbor = Vector2i((key.x + du) % GRID_RES, (key.y + dv) % GRID_RES)
 			if spatial_grid.has(neighbor):
 				for occupant in spatial_grid[neighbor]:
-					if not is_instance_valid(occupant) or not dot_data.has(occupant):
-						continue
-					if dot_data[occupant]["colony"] != my_colony:
-						var d = _cell_key(occupant.position.normalized()).distance_to(Vector2(key))
+					if dot_data.has(occupant) and dot_data[occupant]["colony"] != my_colony:
+						var occ_key = dot_cell.get(occupant, _cell_key(occupant.position.normalized()))
+						var d = float((key - occ_key).length_squared())
 						if d < best_dist:
 							best_dist = d
 							best = occupant
@@ -596,9 +668,7 @@ func _get_foreign_dots_near(dir: Vector3, my_colony: int) -> Array:
 			var neighbor = Vector2i((key.x + du) % GRID_RES, (key.y + dv) % GRID_RES)
 			if spatial_grid.has(neighbor):
 				for occupant in spatial_grid[neighbor]:
-					if not is_instance_valid(occupant) or not dot_data.has(occupant):
-						continue
-					if dot_data[occupant]["colony"] != my_colony:
+					if dot_data.has(occupant) and dot_data[occupant]["colony"] != my_colony:
 						result.append(occupant)
 	return result
 
@@ -615,7 +685,7 @@ func _age_dots():
 
 func _spawn_player_dot():
 	var angle = randf() * TAU
-	player_dot = _create_dot(Vector3(sin(angle), 0.0, cos(angle)), null, LOCAL_COLONY)
+	player_dot = _create_dot(Vector3(sin(angle), 0.0, cos(angle)), null, LOCAL_COLONY, COLONY0_CCE)
 	_focus_on_colony()
 
 func _spawn_enemy_colony():
@@ -623,23 +693,25 @@ func _spawn_enemy_colony():
 	var up = Vector3.UP if abs(player_dir.dot(Vector3.UP)) < 0.99 else Vector3.FORWARD
 	var perp = player_dir.cross(up).normalized()
 	var enemy_dir = (player_dir * cos(PI / 4.0) + perp * sin(PI / 4.0)).normalized()
+	known_colonies[ENEMY_COLONY] = true
 	_create_dot(enemy_dir, null, ENEMY_COLONY, COLONY1_CCE)
 
 func _spawn_dot_near(parent: Node3D, colony: int = LOCAL_COLONY):
 	if parent == null:
+		return
+	if colony_counts.get(colony, 0) >= MAX_POPULATION_PER_COLONY:
 		return
 	var dir = parent.position.normalized()
 	var up = Vector3.UP if abs(dir.dot(Vector3.UP)) < 0.99 else Vector3.FORWARD
 	var tangent = dir.cross(up).normalized()
 	var bitangent = dir.cross(tangent).normalized()
 	var angle = randf() * TAU
-	var nudge = (tangent * cos(angle) + bitangent * sin(angle)) * 0.018
+	var nudge = (tangent * cos(angle) + bitangent * sin(angle)) * SPAWN_NUDGE
 	var new_dir = (dir + nudge).normalized()
-	var my_colony = dot_data[parent].get("colony", colony)
-	if not _is_cell_occupied(new_dir) and not _is_blocked_by_foreign(new_dir, my_colony):
-		_create_dot(new_dir, parent, my_colony)
+	if not _is_cell_occupied(new_dir) and not _is_blocked_by_foreign(new_dir, colony):
+		_create_dot(new_dir, parent, colony, {}, true)
 
-func _create_dot(direction: Vector3, parent, colony: int = LOCAL_COLONY, preset_cce: Dictionary = {}) -> Node3D:
+func _create_dot(direction: Vector3, parent, colony: int = LOCAL_COLONY, preset_cce: Dictionary = {}, full_inheritance: bool = false) -> Node3D:
 	var dot = MeshInstance3D.new()
 	var box = BoxMesh.new()
 	box.size = Vector3(0.015, 0.006, 0.015)
@@ -659,15 +731,21 @@ func _create_dot(direction: Vector3, parent, colony: int = LOCAL_COLONY, preset_
 		cce = _deep_copy_cce(preset_cce)
 	elif parent != null and dot_data.has(parent):
 		var parent_cce = dot_data[parent]["cce"]
-		var dilution = 1.0 if colony == ENEMY_COLONY else CCE_DILUTION
+		var dilution = 1.0 if full_inheritance else CCE_DILUTION
 		for layer in ["motion", "action"]:
 			for key in cce[layer]:
-				cce[layer][key] = parent_cce[layer][key] * dilution
+				if parent_cce[layer].has(key):
+					cce[layer][key] = parent_cce[layer][key] * dilution
 		for key in cce["dials"]:
-			cce["dials"][key] = parent_cce["dials"][key] * dilution
+			if parent_cce["dials"].has(key):
+				cce["dials"][key] = parent_cce["dials"][key] * dilution
 
 	dot_data[dot] = { "age": 0, "cce": cce, "colony": colony }
+	known_colonies[colony] = true
+	colony_counts[colony] = colony_counts.get(colony, 0) + 1
 	_place_dot_on_sphere(dot, direction)
+	# Insert into spatial grid (initial placement)
+	_grid_insert(dot, _cell_key(dot.position.normalized()))
 	_update_dot_color(dot)
 	return dot
 
@@ -685,7 +763,7 @@ func _deep_copy_cce(source: Dictionary) -> Dictionary:
 # --- Camera ---
 
 func _focus_on_colony():
-	var center = _colony_center()
+	var center = _compute_colony_center(LOCAL_COLONY)
 	orbit_yaw = atan2(center.x, center.z)
 	orbit_pitch = asin(clamp(center.y, -1.0, 1.0))
 
@@ -747,14 +825,17 @@ func _zoom(delta: float):
 
 func _place_dot_on_sphere(dot: Node3D, direction: Vector3, check_foreign: bool = false) -> bool:
 	if check_foreign:
-		var my_colony = dot_data[dot].get("colony", LOCAL_COLONY)
+		var my_colony = dot_data[dot]["colony"]
 		if _is_blocked_by_foreign(direction, my_colony):
 			return false
 	var dir = direction.normalized()
-	dot.position = dir * (SPHERE_RADIUS + 0.0075)
+	dot.position = dir * (SPHERE_RADIUS + DOT_SURFACE_OFFSET)
 	var new_basis = Basis()
 	new_basis.y = dir
 	new_basis.x = new_basis.y.cross(Vector3.FORWARD if abs(dir.dot(Vector3.FORWARD)) < 0.99 else Vector3.RIGHT).normalized()
 	new_basis.z = new_basis.x.cross(new_basis.y).normalized()
 	dot.transform.basis = new_basis
+	# Update spatial grid for the new position (only if dot is fully registered)
+	if dot_data.has(dot) and dot_cell.has(dot):
+		_grid_update_position(dot)
 	return true

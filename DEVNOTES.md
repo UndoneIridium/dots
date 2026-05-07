@@ -243,3 +243,66 @@
 - CCE dilution disabled for ENEMY_COLONY (testing only)
 - HUD shows combined CCE across all colonies — should separate per-colony
 - Client FPS tanks at ~8k dots — expected, server will own simulation at scale
+
+---
+
+## Session Notes — 2026-05-07
+
+### Code Audit Pass
+- Removed `face_target` from NEUTRAL_CCE (no execution path)
+- Removed `frequency`, `affinity` dials (unused)
+- Removed `DIAL_BASELINE` (unused)
+- Promoted magic numbers to constants: `SPAWN_NUDGE`, `DEFEND_STEP`, `DOT_SURFACE_OFFSET`, `PARALLEL_EPSILON`, `MAX_CCE_FOR_SATURATION`
+- `_local_recipe()` match statement → `CHANT_RECIPES` data-driven dict
+- Reserved primitives (gather/build/mark) intentionally absent from chant aliases until execution paths exist
+- `USE_SERVER` now `push_warning`s if accidentally enabled
+- Stale `is_instance_valid` checks removed from grid lookups (now relying solely on `dot_data.has`, since `_remove_dot` is synchronous)
+- `_apply_recipe` and `_update_hud` consolidated single-pass
+- `_create_dot` parent CCE inheritance guards against missing keys (forward-compat for differently-shaped colony presets)
+
+### Combat Cluster Index
+- `cluster_by_defender = {}` provides O(1) lookup of "is this defender already in a cluster?"
+- `_initiate_combat` uses index instead of nested O(n×m) scan over all clusters
+- Index maintained on cluster create, append, resolution, and dot removal
+
+### Incremental Spatial Grid
+- `dot_cell = {}` tracks each dot's current cell key
+- `_grid_insert(dot, key)` and `_grid_update_position(dot)` helpers
+- `_place_dot_on_sphere` calls `_grid_update_position` after every move
+- `_create_dot` inserts on creation, `_remove_dot` removes on death
+- Per-tick `_rebuild_spatial_grid` call eliminated
+- Big per-tick performance win at high dot counts
+
+### Colony Population Tracking
+- `colony_counts = {}` — colony_id → live dot count
+- Maintained on `_create_dot` and `_remove_dot`
+- `MAX_POPULATION_PER_COLONY = 1000` testing aid; `_spawn_dot_near` rejects if at cap
+- HUD shows both p0 and p1 counts; updates every tick now (was chant-apply only)
+
+### Fog of War (testing override)
+- `_check_fog_of_war` short-circuits with `return` after the early-exit so ENEMY_COLONY stays grey for visual contrast during testing
+- Remove the bare `return` to restore normal reveal-on-contact behavior
+
+### Colony 0 Preset
+- `COLONY0_CCE` constant added: wander 0.40, attack 0.30, reproduce 0.32 (vs. p1's 0.40/0.40/0.32)
+- All p0 spawns use `full_inheritance: true` for stable testing
+- `_spawn_player_dot` seeds with the preset
+
+### Combat Resolution: Winner Advances
+- When attacker wins, advances into defender's vacated cell after `_remove_dot` clears the spatial grid entry
+- Multi-attacker case: first winner against a given defender claims the cell; others stay put (free to march toward new targets next tick)
+- Implemented via `cell_claimed_by` per cluster + `to_advance` resolved after deletions
+
+### Observations from Testing
+- p1 with split CCE (wander 0.40 / attack 0.40) drifts uncommitted dots away from front during long runs
+- With 1000-cap, p1 starves the front line as wandering dots can't be replaced by reproduction
+- Without cap, p1 reproduction would replenish — but front line cohesion is still a real design issue worth thinking about (e.g. needing a "march toward enemy" or rallying behavior beyond detection radius)
+- Combat math otherwise validates: p1's higher attack consistently wins individual engagements; observable issue is throughput/cohesion not correctness
+
+### Known Issues / TODO
+- gather/build/mark_surface primitives silently do nothing
+- No resource system / surface marking system
+- No multiplayer / server layer
+- CCE dilution disabled for both colonies during testing (full_inheritance for both)
+- p1 keeps using fog color even after contact (testing override — easy revert)
+- Combat lock burden + wander competition causes aggressive colonies to lose front-line cohesion over long runs (design observation, not bug)
