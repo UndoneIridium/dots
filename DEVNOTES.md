@@ -306,3 +306,72 @@
 - CCE dilution disabled for both colonies during testing (full_inheritance for both)
 - p1 keeps using fog color even after contact (testing override — easy revert)
 - Combat lock burden + wander competition causes aggressive colonies to lose front-line cohesion over long runs (design observation, not bug)
+
+
+---
+
+## Session Notes — 2026-05-09
+
+### Rally Banners (combat cohesion fix)
+- `RALLY_RADIUS = 30` cells, `BANNER_TTL = 6` ticks
+- `banners` array: `{cell, colony, ticks_remaining}` — no visual, pure data
+- Dropped on `_initiate_combat` for BOTH attacker and defender colonies at the contact cell
+- Refresh-on-redrop semantics: existing banner at same cell+colony has TTL refreshed instead of duplicated
+- Friendly-only pull: when a dot rolls `attack` and finds no foreign in `ATTACK_DETECT_RADIUS`, falls back to `_march_toward_banner` which targets nearest same-colony banner within `RALLY_RADIUS`
+- Banner cell→sphere direction conversion via `_cell_to_dir` (inverse of `_cell_key`)
+- `_torus_cell_dist_sq` helper for wrap-around grid distance
+- `_march_toward` refactored to share tangent-step math with banner march via `_march_toward_dir`
+- Validated by long-run match: p1 (0.40 attack) cleanly encircled and wiped p0 (0.30 attack) — the cohesion fix lets attacker CCE concentrate at the front rather than diffusing into wandering
+
+### Walls / Blocks (Step 1 of defense system)
+- "Block" is the user-facing term; `is_wall` flag and `wall_*` names retained for code load-bearing
+- `WALL_DEFEND_VALUE = 0.5`, `WALL_DECAY_TICKS = 300`, `WALL_MESH_SIZE = (0.015, 0.003, 0.015)` (half a dot's height), `WALL_HEIGHT_STEP = 0.003`
+- `wall_counts` dict tracks per-colony wall count separately from `colony_counts` (walls don't count toward population)
+- `_create_wall(cell, colony)` creates a wall as a special dot: `is_wall: true`, immobile, no primitive ticking, separate decay counter, defend = 0.5
+- Walls live in spatial_grid like normal dots; a wall cell appears occupied so dots can't move/spawn into it
+- Wall-aware combat resolution: when an attacker beats a wall, the wall is removed but the attacker only advances if the cell becomes empty (i.e., the stack is exhausted)
+- `_age_dots` branches on `is_wall`: walls decrement decay counter, dots increment age
+- HUD now shows wall count: `p0: N (walls: M)   p1: K`
+- `build_upward` added to `CCE_COLORS` (gray-purple)
+- Enemy colony spawn commented out for build dev work (single-colony test environment)
+
+### Build Banner Mechanic (block clustering / monuments)
+- `BUILD_BANNER_RADIUS = 15`, `BUILD_BANNER_TTL = 6`, `BUILD_START_CHANCE = 0.05`, `BUILD_AT_BANNER_STACK_PREF = 0.8`
+- `build_banners` array with unique IDs (separate from rally `banners`)
+- Per-dot `build_banners_used` set tracks which banners a dot has already contributed to
+- `_execute_build` flow:
+  - Look for nearest unused build banner in radius
+  - If found and at/adjacent: build in own cell, refresh banner, mark used
+  - If found but not adjacent: march toward banner, no build this tick
+  - If none found: 5% chance to start new monument (place block in own cell, drop banner, founder marks it used)
+- Build always places in dot's own cell — no 8-neighbor scattering, builders that walked to the banner cluster their blocks at that cell
+- Stack height: `_create_wall` counts existing same-colony walls in target cell to determine `stack_index`, places new wall at `radius + offset + stack_index * WALL_HEIGHT_STEP` along surface normal
+- Active monuments don't crumble: when a new wall is added to a stack, all existing walls in the cell have their decay timer refreshed. Abandoned stacks decay top-down naturally.
+- Founder placement defaults to own cell (changed from "any empty adjacent")
+
+### Combat Mechanics Summary (current state)
+Each tick, every dot rolls one primitive from its CCE pool weighted by current values. Rolling `attack` searches a 10-cell radius for any foreign dot, marches toward the nearest one if found (or marches toward the nearest friendly rally banner within 30 cells if not), and initiates combat on contact, which drops a 6-tick rally banner at the contact cell for both colonies and locks the attacker and defender in a 3-tick combat cluster (2 ticks if attacker intensity > 0.7). When the cluster expires, each pair compares `attack + defend` power deterministically with ties going to the attacker — the loser dies, the winner advances into the vacated cell unless the cell still contains other entities (e.g. remaining walls in a stack). Pile-ons against a single defender all resolve against that one defender's power.
+
+In actual play, chants don't reshape spawning at all — they add CHANT_WEIGHT (0.08) to every existing same-colony dot's CCE on each chant — so a player chanting "attack" makes their living army incrementally more aggressive while reproduction continues diluting offspring at 70% of parent CCE per generation. Combat strength is a race between the player's chants pumping the existing population up and dilution pulling new dots back down toward neutral. Rally banners act as the connective tissue, taking the diffuse attack-CCE the chant has spread across the colony and concentrating it onto wherever contact actually happens.
+
+### Defense Wall Design (Step 2, NOT YET IMPLEMENTED)
+Future work, recorded for continuity:
+- Defense banners (separate from build banners) drop anticipatorily based on threat scoring
+- Threat score per cell ~= enemy_count * mean_enemy_attack_cce * proximity_falloff
+- Banner shape is a rectangular line, perpendicular to threat bearing, sitting between colony center and threat
+- Non-combat dots positioned on the line, then build under themselves (rider variant) — wall absorbs first combat, rider fights second
+- Rider drops with 1-tick stun when wall destroyed
+- Combat banners (existing rally system) suppress build_upward in their radius — no walling during active combat
+- Threat scoring: cheapest viable function; possibly periodic global scan every ~5 ticks rather than per-tick per-dot
+
+### Known Issues / TODO
+- gather/mark_surface primitives silently do nothing
+- No resource system / surface marking system
+- No multiplayer / server layer
+- CCE dilution still 0.7 — interacts non-trivially with reproduction (intensity falls off generationally, reproduction success collapses) — may want USE_DILUTION flag for clean static-CCE testing
+- Defense banners and threat scoring unimplemented
+- Rider mechanic for stacked wall+dot unimplemented
+- Monument visualization: dots visually overlap with walls they just built (rider rendering not yet wired)
+- p1 keeps using fog color even after contact (testing override)
+- HUD shows combined CCE across all colonies — should separate per-colony
+- Combat is deterministic (a + d power compared, ties to attacker) — probabilistic combat discussed but not implemented; would interact with dilution and noise floor at high generations

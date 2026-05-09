@@ -32,9 +32,31 @@ var dot_cell = {}      # dot -> current cell_key, for incremental grid updates
 # Attack
 const ATTACK_DETECT_RADIUS = 10  # in grid cells
 
+# Rally banners (dropped on combat contact, friendly-only pull)
+const RALLY_RADIUS = 30  # cells; how far a banner pulls reinforcements
+const BANNER_TTL = 6     # ticks a banner persists after contact
+var banners = []  # [{cell: Vector2i, colony: int, ticks_remaining: int}]
+
 # Per-colony population cap (testing aid)
 const MAX_POPULATION_PER_COLONY = 1000
 var colony_counts = {}  # colony_id -> current dot count
+
+# Walls / blocks (separate from population)
+# Note: "block" is the user-facing term. The is_wall flag and wall_* names are
+# load-bearing across the codebase \u2014 will rename later.
+const WALL_DEFEND_VALUE = 0.5
+const WALL_DECAY_TICKS = 300
+const WALL_MESH_SIZE = Vector3(0.015, 0.003, 0.015)  # half a dot's height
+const WALL_HEIGHT_STEP = 0.003  # vertical spacing between stacked blocks (== mesh y-size)
+var wall_counts = {}  # colony_id -> current wall count
+
+# Build banners (anchored at a placed block, attracting nearby builders)
+const BUILD_BANNER_RADIUS = 15
+const BUILD_BANNER_TTL = 6
+const BUILD_START_CHANCE = 0.05  # chance a build_upward roll starts a new monument when no banner is in range
+const BUILD_AT_BANNER_STACK_PREF = 0.8  # prob. of stacking when building at a banner
+var build_banners = []  # [{id: int, cell: Vector2i, colony: int, ticks_remaining: int}]
+var _next_build_banner_id = 1
 
 # Tuning constants (formerly magic numbers)
 const SPAWN_NUDGE = 0.018
@@ -71,6 +93,7 @@ const CCE_COLORS = {
 	"reproduce": Color(0.3, 0.9, 0.3),
 	"defend": Color(0.2, 0.5, 1.0),
 	"attack": Color(1.0, 0.2, 0.2),
+	"build_upward": Color(0.6, 0.6, 0.7),
 }
 const CCE_NEUTRAL_COLOR = Color(1.0, 1.0, 1.0)
 
@@ -147,11 +170,11 @@ const COLONY0_CCE = {
 	},
 	"action": {
 		"mark_surface": 0.0,
-		"build_upward": 0.0,
+		"build_upward": 0.40,
 		"gather": 0.0,
 		"defend": 0.0,
-		"attack": 0.30,
-		"reproduce": 0.32
+		"attack": 0.0,
+		"reproduce": 0.40
 	},
 	"dials": {
 		"range": 0.5,
@@ -184,7 +207,7 @@ var _cached_colony_center = Vector3.ZERO
 
 func _ready():
 	_spawn_player_dot()
-	_spawn_enemy_colony()
+	# _spawn_enemy_colony()  # disabled for build dev work
 	_update_camera()
 	_update_hud()
 	chant_button.pressed.connect(_open_chant)
@@ -227,6 +250,8 @@ func _process(delta):
 		# Spatial grid is now incrementally maintained \u2014 no rebuild needed
 		_cached_colony_center = _compute_colony_center(LOCAL_COLONY)
 		_check_fog_of_war()
+		_tick_banners()
+		_tick_build_banners()
 		_tick_combat_clusters()
 		_tick_all_dots()
 		_update_hud()
@@ -285,6 +310,8 @@ func _update_hud():
 	for dot in dots:
 		if dot_data[dot]["colony"] != LOCAL_COLONY:
 			continue
+		if dot_data[dot].get("is_wall", false):
+			continue
 		count += 1
 		var cce = dot_data[dot]["cce"]
 		for key in cce["motion"]:
@@ -297,7 +324,8 @@ func _update_hud():
 	var sorted_keys = totals.keys()
 	sorted_keys.sort_custom(func(a, b): return totals[a] > totals[b])
 	var p1_count = colony_counts.get(ENEMY_COLONY, 0)
-	var lines = ["p0: %d   p1: %d" % [count, p1_count]]
+	var p0_walls = wall_counts.get(LOCAL_COLONY, 0)
+	var lines = ["p0: %d (walls: %d)   p1: %d" % [count, p0_walls, p1_count]]
 	var shown = 0
 	for key in sorted_keys:
 		var avg = totals[key] / count
@@ -332,6 +360,8 @@ func _process_chant_locally(text: String):
 func _tick_all_dots():
 	for dot in dots:
 		if combat_locked.has(dot):
+			continue
+		if dot_data[dot].get("is_wall", false):
 			continue
 		_tick_dot(dot)
 
@@ -390,13 +420,17 @@ func _execute_primitive(dot: Node3D, primitive: String, dials: Dictionary):
 			var toward = (_cached_colony_center - dir).normalized()
 			var new_dir = (dir + toward * DEFEND_STEP).normalized()
 			_place_dot_on_sphere(dot, new_dir, true)
-		# gather, build_upward, mark_surface, face_target: reserved \u2014 no-op
+		"build_upward":
+			_execute_build(dot)
+		# gather, mark_surface, face_target: reserved \u2014 no-op
 
 func _execute_attack(dot: Node3D, intensity: float):
 	var my_colony = dot_data[dot]["colony"]
 	var my_dir = dot.position.normalized()
 	var target = _find_nearest_foreign_in_radius(my_dir, my_colony, ATTACK_DETECT_RADIUS)
 	if target == null:
+		# No enemy in detect range \u2014 check for a friendly rally banner to march toward
+		_march_toward_banner(dot, my_dir, my_colony)
 		return
 	if combat_locked.has(dot) or combat_locked.has(target):
 		return
@@ -418,9 +452,16 @@ func _initiate_combat(attacker: Node3D, defender: Node3D, intensity: float):
 		var cluster = {"pairs": [{"attacker": attacker, "defender": defender}], "ticks_remaining": ticks}
 		combat_clusters.append(cluster)
 		cluster_by_defender[defender] = cluster
+	# Drop rally banners for both sides at the contact cell
+	var contact_cell = _cell_key(defender.position.normalized())
+	_drop_banner(contact_cell, dot_data[attacker]["colony"])
+	_drop_banner(contact_cell, dot_data[defender]["colony"])
 
 func _march_toward(dot: Node3D, my_dir: Vector3, target: Node3D, my_colony: int):
 	var target_dir = target.position.normalized()
+	_march_toward_dir(dot, my_dir, target_dir, my_colony)
+
+func _march_toward_dir(dot: Node3D, my_dir: Vector3, target_dir: Vector3, my_colony: int):
 	var toward = target_dir - my_dir
 	if toward.length_squared() < PARALLEL_EPSILON:
 		return
@@ -432,6 +473,179 @@ func _march_toward(dot: Node3D, my_dir: Vector3, target: Node3D, my_colony: int)
 	var new_dir = (my_dir + tangent * CELL_STEP).normalized()
 	if not _is_foreign_in_exact_cell(new_dir, my_colony):
 		_place_dot_on_sphere(dot, new_dir)
+
+# --- Build (walls) ---
+
+func _execute_build(dot: Node3D):
+	var my_colony = dot_data[dot]["colony"]
+	var my_dir = dot.position.normalized()
+	var my_cell = _cell_key(my_dir)
+	# Look for an active, unused build banner within range
+	var nearest_banner = _find_eligible_build_banner(dot, my_cell, my_colony)
+	if nearest_banner != null:
+		var banner_cell = nearest_banner["cell"]
+		if _is_at_or_adjacent(my_cell, banner_cell):
+			# At the monument \u2014 build in own cell, refresh banner, mark used
+			_create_wall(my_cell, my_colony)
+			_refresh_build_banner(nearest_banner["id"])
+			dot_data[dot]["build_banners_used"][nearest_banner["id"]] = true
+		else:
+			# March toward the banner; do not build this tick
+			var banner_dir = _cell_to_dir(banner_cell)
+			_march_toward_dir(dot, my_dir, banner_dir, my_colony)
+		return
+	# No eligible banner in range \u2014 rare chance to start a new monument
+	if randf() >= BUILD_START_CHANCE:
+		return
+	_create_wall(my_cell, my_colony)
+	var banner_id = _drop_build_banner(my_cell, my_colony)
+	# Founder is considered to have used this banner (so they don't get pulled back to it)
+	dot_data[dot]["build_banners_used"][banner_id] = true
+
+func _is_at_or_adjacent(a: Vector2i, b: Vector2i) -> bool:
+	return _torus_cell_dist_sq(a, b) <= 2
+
+func _find_eligible_build_banner(dot: Node3D, my_cell: Vector2i, my_colony: int):
+	if build_banners.is_empty():
+		return null
+	var used = dot_data[dot].get("build_banners_used", {})
+	var best = null
+	var best_dist = BUILD_BANNER_RADIUS * BUILD_BANNER_RADIUS + 1
+	for banner in build_banners:
+		if banner["colony"] != my_colony:
+			continue
+		if used.has(banner["id"]):
+			continue
+		var d = _torus_cell_dist_sq(my_cell, banner["cell"])
+		if d < best_dist:
+			best_dist = d
+			best = banner
+	return best
+
+func _create_wall(cell: Vector2i, colony: int) -> Node3D:
+	# Determine stack index by counting same-colony walls already in this cell
+	var stack_index = 0
+	if spatial_grid.has(cell):
+		for occupant in spatial_grid[cell]:
+			if dot_data.has(occupant) and dot_data[occupant].get("is_wall", false):
+				stack_index += 1
+	# Refresh decay on existing walls in this cell so active monuments don't crumble
+	if spatial_grid.has(cell):
+		for occupant in spatial_grid[cell]:
+			if dot_data.has(occupant) and dot_data[occupant].get("is_wall", false):
+				dot_data[occupant]["decay_ticks_remaining"] = WALL_DECAY_TICKS
+	var wall = MeshInstance3D.new()
+	var box = BoxMesh.new()
+	box.size = WALL_MESH_SIZE
+	wall.mesh = box
+	var mat = StandardMaterial3D.new()
+	mat.albedo_color = Color.CYAN
+	mat.emission_enabled = true
+	mat.emission = Color.CYAN
+	mat.emission_energy_multiplier = 0.6
+	wall.material_override = mat
+	wall.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
+	add_child(wall)
+	dots.append(wall)
+	var dir = _cell_to_dir(cell)
+	dot_data[wall] = {
+		"age": 0,
+		"cce": _deep_copy_cce(NEUTRAL_CCE),
+		"colony": colony,
+		"is_wall": true,
+		"decay_ticks_remaining": WALL_DECAY_TICKS,
+		"stack_index": stack_index,
+	}
+	# Walls have defend = WALL_DEFEND_VALUE so they fight back via the standard combat formula
+	dot_data[wall]["cce"]["action"]["defend"] = WALL_DEFEND_VALUE
+	known_colonies[colony] = true
+	wall_counts[colony] = wall_counts.get(colony, 0) + 1
+	# Place the wall along the surface normal at stack_index * step above the surface
+	wall.position = dir * (SPHERE_RADIUS + DOT_SURFACE_OFFSET + stack_index * WALL_HEIGHT_STEP)
+	var new_basis = Basis()
+	new_basis.y = dir
+	new_basis.x = new_basis.y.cross(Vector3.FORWARD if abs(dir.dot(Vector3.FORWARD)) < 0.99 else Vector3.RIGHT).normalized()
+	new_basis.z = new_basis.x.cross(new_basis.y).normalized()
+	wall.transform.basis = new_basis
+	_grid_insert(wall, cell)
+	_update_dot_color(wall)
+	return wall
+
+# --- Build banners ---
+
+func _drop_build_banner(cell: Vector2i, colony: int) -> int:
+	var id = _next_build_banner_id
+	_next_build_banner_id += 1
+	build_banners.append({"id": id, "cell": cell, "colony": colony, "ticks_remaining": BUILD_BANNER_TTL})
+	return id
+
+func _refresh_build_banner(id: int):
+	for banner in build_banners:
+		if banner["id"] == id:
+			banner["ticks_remaining"] = BUILD_BANNER_TTL
+			return
+
+func _tick_build_banners():
+	var i = build_banners.size() - 1
+	while i >= 0:
+		build_banners[i]["ticks_remaining"] -= 1
+		if build_banners[i]["ticks_remaining"] <= 0:
+			build_banners.remove_at(i)
+		i -= 1
+
+# --- Rally banners ---
+
+func _drop_banner(cell: Vector2i, colony: int):
+	# Refresh TTL if a banner already exists at this cell for this colony
+	for banner in banners:
+		if banner["colony"] == colony and banner["cell"] == cell:
+			banner["ticks_remaining"] = BANNER_TTL
+			return
+	banners.append({"cell": cell, "colony": colony, "ticks_remaining": BANNER_TTL})
+
+func _tick_banners():
+	var i = banners.size() - 1
+	while i >= 0:
+		banners[i]["ticks_remaining"] -= 1
+		if banners[i]["ticks_remaining"] <= 0:
+			banners.remove_at(i)
+		i -= 1
+
+func _cell_to_dir(cell: Vector2i) -> Vector3:
+	# Inverse of _cell_key: cell coord -> sphere direction
+	var u = (float(cell.x) / GRID_RES - 0.5) * TAU
+	var v = (float(cell.y) / GRID_RES - 0.5) * PI
+	var y = sin(v)
+	var r = cos(v)
+	return Vector3(r * sin(u), y, r * cos(u)).normalized()
+
+func _torus_cell_dist_sq(a: Vector2i, b: Vector2i) -> int:
+	# Wrap-around distance squared on the GRID_RES x GRID_RES torus
+	var dx = abs(a.x - b.x)
+	if dx > GRID_RES / 2:
+		dx = GRID_RES - dx
+	var dy = abs(a.y - b.y)
+	if dy > GRID_RES / 2:
+		dy = GRID_RES - dy
+	return dx * dx + dy * dy
+
+func _march_toward_banner(dot: Node3D, my_dir: Vector3, my_colony: int):
+	if banners.is_empty():
+		return
+	var my_cell = _cell_key(my_dir)
+	var best = null
+	var best_dist = RALLY_RADIUS * RALLY_RADIUS + 1
+	for banner in banners:
+		if banner["colony"] != my_colony:
+			continue
+		var d = _torus_cell_dist_sq(my_cell, banner["cell"])
+		if d < best_dist:
+			best_dist = d
+			best = banner
+	if best == null:
+		return
+	var target_dir = _cell_to_dir(best["cell"])
+	_march_toward_dir(dot, my_dir, target_dir, my_colony)
 
 # --- Combat ---
 
@@ -454,12 +668,26 @@ func _tick_combat_clusters():
 					continue
 				var a_power = dot_data[attacker]["cce"]["action"].get("attack", 0.0) + dot_data[attacker]["cce"]["action"].get("defend", 0.0)
 				var d_power = dot_data[defender]["cce"]["action"].get("attack", 0.0) + dot_data[defender]["cce"]["action"].get("defend", 0.0)
+				var defender_is_wall = dot_data[defender].get("is_wall", false)
 				if a_power >= d_power:
 					to_delete[defender] = true
-					# First winning attacker against this defender claims the cell
-					if not cell_claimed_by.has(defender):
-						cell_claimed_by[defender] = attacker
-						to_advance.append({"winner": attacker, "target_dir": defender.position.normalized()})
+					if defender_is_wall:
+						# Attacker advances only if the cell will be empty after this wall is removed
+						var wall_cell = dot_cell.get(defender)
+						var cell_will_be_empty = true
+						if wall_cell != null and spatial_grid.has(wall_cell):
+							for occupant in spatial_grid[wall_cell]:
+								if occupant != defender and not to_delete.has(occupant):
+									cell_will_be_empty = false
+									break
+						if cell_will_be_empty and not cell_claimed_by.has(defender):
+							cell_claimed_by[defender] = attacker
+							to_advance.append({"winner": attacker, "target_dir": defender.position.normalized()})
+					else:
+						# First winning attacker against this defender claims the cell
+						if not cell_claimed_by.has(defender):
+							cell_claimed_by[defender] = attacker
+							to_advance.append({"winner": attacker, "target_dir": defender.position.normalized()})
 				else:
 					to_delete[attacker] = true
 			for pair in cluster["pairs"]:
@@ -514,7 +742,10 @@ func _remove_dot(dot: Node3D):
 		combat_clusters.erase(cluster)
 	dots.erase(dot)
 	var removed_colony = dot_data[dot]["colony"]
-	colony_counts[removed_colony] = max(0, colony_counts.get(removed_colony, 0) - 1)
+	if dot_data[dot].get("is_wall", false):
+		wall_counts[removed_colony] = max(0, wall_counts.get(removed_colony, 0) - 1)
+	else:
+		colony_counts[removed_colony] = max(0, colony_counts.get(removed_colony, 0) - 1)
 	dot_data.erase(dot)
 	combat_locked.erase(dot)
 	if dot == player_dot:
@@ -677,9 +908,14 @@ func _get_foreign_dots_near(dir: Vector3, my_colony: int) -> Array:
 func _age_dots():
 	var to_remove = []
 	for dot in dots:
-		dot_data[dot]["age"] += 1
-		if dot_data[dot]["age"] >= DOT_LIFETIME:
-			to_remove.append(dot)
+		if dot_data[dot].get("is_wall", false):
+			dot_data[dot]["decay_ticks_remaining"] -= 1
+			if dot_data[dot]["decay_ticks_remaining"] <= 0:
+				to_remove.append(dot)
+		else:
+			dot_data[dot]["age"] += 1
+			if dot_data[dot]["age"] >= DOT_LIFETIME:
+				to_remove.append(dot)
 	for dot in to_remove:
 		_remove_dot(dot)
 
@@ -740,7 +976,7 @@ func _create_dot(direction: Vector3, parent, colony: int = LOCAL_COLONY, preset_
 			if parent_cce["dials"].has(key):
 				cce["dials"][key] = parent_cce["dials"][key] * dilution
 
-	dot_data[dot] = { "age": 0, "cce": cce, "colony": colony }
+	dot_data[dot] = { "age": 0, "cce": cce, "colony": colony, "build_banners_used": {} }
 	known_colonies[colony] = true
 	colony_counts[colony] = colony_counts.get(colony, 0) + 1
 	_place_dot_on_sphere(dot, direction)
