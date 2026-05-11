@@ -54,9 +54,17 @@ var wall_counts = {}  # colony_id -> current wall count
 const BUILD_BANNER_RADIUS = 15
 const BUILD_BANNER_TTL = 6
 const BUILD_START_CHANCE = 0.05  # chance a build_upward roll starts a new monument when no banner is in range
-const BUILD_AT_BANNER_STACK_PREF = 0.8  # prob. of stacking when building at a banner
+const BUILD_AT_BANNER_STACK_PREF = 0.8  # base prob. of stacking when building at a banner (at height 0)
+const STACK_HEIGHT_SOFTCAP = 10  # stack pref scales linearly to ~0 at this height
 var build_banners = []  # [{id: int, cell: Vector2i, colony: int, ticks_remaining: int}]
 var _next_build_banner_id = 1
+
+# Test mode \u2014 fixed population, logs primitive rolls & wall placements to LOG_FILE
+const TEST_MODE = true
+const TEST_POPULATION = 15
+const LOG_FILE = "res://build_log.txt"
+var _next_dot_id = 1
+var _tick_num = 0
 
 # Tuning constants (formerly magic numbers)
 const SPAWN_NUDGE = 0.018
@@ -207,7 +215,15 @@ var single_touch_index = -1
 var _cached_colony_center = Vector3.ZERO
 
 func _ready():
+	if TEST_MODE:
+		# Wipe log at session start
+		var f = FileAccess.open(LOG_FILE, FileAccess.WRITE)
+		if f:
+			f.store_string("")
+			f.close()
 	_spawn_player_dot()
+	if TEST_MODE:
+		_spawn_test_population()
 	# _spawn_enemy_colony()  # disabled for build dev work
 	_update_camera()
 	_update_hud()
@@ -248,6 +264,7 @@ func _process(delta):
 	tick_timer += delta
 	if tick_timer >= TICK_SPEED:
 		tick_timer = 0.0
+		_tick_num += 1
 		_check_chant_file()
 		_age_dots()
 		# Spatial grid is now incrementally maintained \u2014 no rebuild needed
@@ -392,6 +409,9 @@ func _tick_dot(dot: Node3D):
 			break
 	if chosen == "":
 		return
+	if TEST_MODE and dot_data[dot]["colony"] == LOCAL_COLONY:
+		var cell = _cell_key(dot.position.normalized())
+		_log("[t%d] dot %d at (%d,%d) roll: %s" % [_tick_num, dot_data[dot]["dot_id"], cell.x, cell.y, chosen])
 	_execute_primitive(dot, chosen, cce["dials"])
 
 func _execute_primitive(dot: Node3D, primitive: String, dials: Dictionary):
@@ -488,8 +508,13 @@ func _execute_build(dot: Node3D):
 	if nearest_banner != null:
 		var banner_cell = nearest_banner["cell"]
 		if _is_at_or_adjacent(my_cell, banner_cell):
-			# At the monument \u2014 build in own cell, refresh banner, mark used
-			_create_wall(my_cell, my_colony)
+			# At the monument \u2014 stack pref decays with current tower height; near-zero by STACK_HEIGHT_SOFTCAP
+			var current_height = _count_walls_in_cell(banner_cell, my_colony)
+			var height_factor = clamp(1.0 - float(current_height) / float(STACK_HEIGHT_SOFTCAP), 0.0, 1.0)
+			var stack_pref = BUILD_AT_BANNER_STACK_PREF * height_factor
+			var build_cell = banner_cell if randf() < stack_pref else _pick_lateral_cell(banner_cell, my_colony)
+			var reason_str = "stack" if build_cell == banner_cell else "lateral"
+			_create_wall(build_cell, my_colony, dot_data[dot]["dot_id"], reason_str)
 			_refresh_build_banner(nearest_banner["id"])
 			dot_data[dot]["build_banners_used"][nearest_banner["id"]] = true
 		else:
@@ -500,7 +525,7 @@ func _execute_build(dot: Node3D):
 	# No eligible banner in range \u2014 rare chance to start a new monument
 	if randf() >= BUILD_START_CHANCE:
 		return
-	_create_wall(my_cell, my_colony)
+	_create_wall(my_cell, my_colony, dot_data[dot]["dot_id"], "founder")
 	var banner_id = _drop_build_banner(my_cell, my_colony)
 	# Founder is considered to have used this banner (so they don't get pulled back to it)
 	dot_data[dot]["build_banners_used"][banner_id] = true
@@ -525,13 +550,40 @@ func _find_eligible_build_banner(dot: Node3D, my_cell: Vector2i, my_colony: int)
 			best = banner
 	return best
 
-func _create_wall(cell: Vector2i, colony: int) -> Node3D:
+func _pick_lateral_cell(banner_cell: Vector2i, colony: int) -> Vector2i:
+	# Returns a neighbor of banner_cell preferring empty (no same-colony wall) cells.
+	# Falls back to a random neighbor if all 8 contain same-colony walls.
+	var empty = []
+	var all_neighbors = []
+	for du in [-1, 0, 1]:
+		for dv in [-1, 0, 1]:
+			if du == 0 and dv == 0:
+				continue
+			var nb = Vector2i((banner_cell.x + du + GRID_RES) % GRID_RES, (banner_cell.y + dv + GRID_RES) % GRID_RES)
+			all_neighbors.append(nb)
+			if _count_walls_in_cell(nb, colony) == 0:
+				empty.append(nb)
+	if not empty.is_empty():
+		return empty[randi() % empty.size()]
+	return all_neighbors[randi() % all_neighbors.size()]
+
+func _count_walls_in_cell(cell: Vector2i, colony: int) -> int:
+	var n = 0
+	if spatial_grid.has(cell):
+		for occupant in spatial_grid[cell]:
+			if dot_data.has(occupant) and dot_data[occupant].get("is_wall", false) and dot_data[occupant]["colony"] == colony:
+				n += 1
+	return n
+
+func _create_wall(cell: Vector2i, colony: int, builder_id: int = -1, reason: String = "") -> Node3D:
 	# Determine stack index by counting same-colony walls already in this cell
 	var stack_index = 0
 	if spatial_grid.has(cell):
 		for occupant in spatial_grid[cell]:
 			if dot_data.has(occupant) and dot_data[occupant].get("is_wall", false):
 				stack_index += 1
+	if TEST_MODE and builder_id >= 0:
+		_log("[t%d] wall: builder=%d cell=(%d,%d) reason=%s height=%d" % [_tick_num, builder_id, cell.x, cell.y, reason, stack_index])
 	# Refresh decay on existing walls in this cell so active monuments don't crumble
 	if spatial_grid.has(cell):
 		for occupant in spatial_grid[cell]:
@@ -935,6 +987,43 @@ func _spawn_enemy_colony():
 	known_colonies[ENEMY_COLONY] = true
 	_create_dot(enemy_dir, null, ENEMY_COLONY, COLONY1_CCE)
 
+func _log(line: String):
+	if not TEST_MODE:
+		return
+	var f = FileAccess.open(LOG_FILE, FileAccess.READ_WRITE)
+	if f == null:
+		f = FileAccess.open(LOG_FILE, FileAccess.WRITE)
+		if f == null:
+			return
+	f.seek_end()
+	f.store_string(line + "\n")
+	f.close()
+
+func _spawn_test_population():
+	# Disable reproduce on the founder so population stays controlled
+	if player_dot and dot_data.has(player_dot):
+		dot_data[player_dot]["cce"]["action"]["reproduce"] = 0.0
+	var founder_dir = player_dot.position.normalized()
+	var up = Vector3.UP if abs(founder_dir.dot(Vector3.UP)) < 0.99 else Vector3.FORWARD
+	var tangent = founder_dir.cross(up).normalized()
+	var bitangent = founder_dir.cross(tangent).normalized()
+	var to_spawn = TEST_POPULATION - 1  # founder already exists
+	var spawned = 0
+	var attempts = 0
+	while spawned < to_spawn and attempts < 200:
+		attempts += 1
+		var angle = randf() * TAU
+		var radius = lerp(SPAWN_NUDGE, SPAWN_NUDGE * 4.0, randf())
+		var nudge = (tangent * cos(angle) + bitangent * sin(angle)) * radius
+		var dir = (founder_dir + nudge).normalized()
+		if _is_cell_occupied(dir):
+			continue
+		var new_dot = _create_dot(dir, null, LOCAL_COLONY, COLONY0_CCE)
+		# Disable reproduce so population is fixed
+		dot_data[new_dot]["cce"]["action"]["reproduce"] = 0.0
+		spawned += 1
+	print("[test] spawned %d test dots (founder + %d), log: %s" % [spawned + 1, spawned, LOG_FILE])
+
 func _spawn_dot_near(parent: Node3D, colony: int = LOCAL_COLONY):
 	if parent == null:
 		return
@@ -979,7 +1068,8 @@ func _create_dot(direction: Vector3, parent, colony: int = LOCAL_COLONY, preset_
 			if parent_cce["dials"].has(key):
 				cce["dials"][key] = parent_cce["dials"][key] * dilution
 
-	dot_data[dot] = { "age": 0, "cce": cce, "colony": colony, "build_banners_used": {} }
+	dot_data[dot] = { "age": 0, "cce": cce, "colony": colony, "build_banners_used": {}, "dot_id": _next_dot_id }
+	_next_dot_id += 1
 	known_colonies[colony] = true
 	colony_counts[colony] = colony_counts.get(colony, 0) + 1
 	_place_dot_on_sphere(dot, direction)

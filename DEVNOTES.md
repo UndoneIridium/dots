@@ -445,3 +445,61 @@ Added a VSlider node (`UI/ZoomSlider`) for trackpad-zoom workaround on macOS:
 - `main.gd`: rally banners, build primitive, build banners, wall stacking, zoom slider wiring
 - `main.tscn`: added `UI/ZoomSlider` (VSlider)
 - `DEVNOTES.md`: this file
+
+
+---
+
+## Session Notes \u2014 2026-05-11 (build mechanic diagnostic)
+
+### Applied the 80/20 fix
+
+Applied the spec'd fix from the previous session: at-banner builders now 80% stack at `banner_cell`, 20% build laterally. Stacking immediately started working visually \u2014 individual towers grew vertically at founder blocks. But towers grew **too fast** with no horizontal spread.
+
+### Scaled stack pref by height
+
+Added `STACK_HEIGHT_SOFTCAP = 10`. Stack preference now decays linearly:
+```
+stack_pref = BUILD_AT_BANNER_STACK_PREF * clamp(1 - height/STACK_HEIGHT_SOFTCAP, 0, 1)
+```
+- h=0 \u2192 80% stack / 20% lateral
+- h=5 \u2192 40% / 60%
+- h\u226510 \u2192 0% / 100%
+
+New helper `_count_walls_in_cell(cell, colony)` for the height check. Same-colony walls only, so an enemy wall in the cell doesn't slow your tower.
+
+### Lateral helper (`_pick_lateral_cell`)
+
+The lateral branch was still building in `my_cell` \u2014 i.e. wherever the follower happened to be standing. Since most followers approach the banner from the same direction (colony cloud geometry), every "lateral" build piled into the same approach-side cell. Added `_pick_lateral_cell(banner_cell, colony)`: pick a random neighbor of the banner, preferring cells with no same-colony walls; fall back to a random neighbor if all 8 are full.
+
+### Lines persisted \u2014 diagnostic logging
+
+Visible behavior after all three fixes: stacking works, but lines still form alongside the towers, growing roughly north. Added test-mode infrastructure to figure out why:
+
+- `TEST_MODE` flag, `TEST_POPULATION = 15`, `LOG_FILE = res://build_log.txt`
+- `_spawn_test_population()` seeds 15 dots near the founder, forces all of them to `reproduce = 0` so population stays fixed
+- `dot_id` (1..15) assigned per dot via `_next_dot_id` counter
+- `_log(line)` appends to LOG_FILE (truncated at session start)
+- Every primitive roll logged in `_tick_dot` with `dot_id`, cell, primitive name
+- Every wall placement logged in `_create_wall` with builder_id, cell, reason (founder/stack/lateral), and post-build height
+- `_tick_num` counter for chronological ordering
+
+### Diagnosis from the log
+
+30 ticks of clean data revealed two distinct issues:
+
+1. **Founder chain** \u2014 `build_banners_used` (the per-dot set tracking which banners a dot has already contributed to) is the line generator. When a dot uses banner A, A is permanently dead to them. Next time they roll build, no eligible banner is in range \u2192 fall through to founder path \u2192 5% start a new monument **right where they're standing**, which is adjacent to A's footprint. Repeat: A, then B next to A, then C next to B, etc. The "lines" are actually a chain of distinct founder towers each just 1-2 cells from the last.
+
+2. **Lateral helper produces height-6 "lateral" builds** \u2014 example from log: `[t26] wall: builder=7 cell=(164,98) reason=lateral height=6`. Tower B's banner sits at cell B, and one of B's neighbors is tower A's cell with 6 walls already on it. `_pick_lateral_cell` falls back through to A when... actually it shouldn't, since A is non-empty. Suspected cause: the banner driving builder 7 is somewhere whose neighborhood includes (164,98), and the lateral helper's empty-check is working but the founder chain has positioned banners such that "lateral" builds keep landing on existing tall stacks. Net effect either way: laterals are reinforcing existing tall towers instead of growing footprints.
+
+### Proposed fixes (UNRESOLVED \u2014 START HERE NEXT SESSION)
+
+A. **Kill the founder chain.** Remove `build_banners_used` tracking entirely. Dots can return to the same banner repeatedly. The 80/20 stack-vs-lateral logic and height-scaling provide enough variety; the cool-down is doing more harm than good. Founder path then only triggers when there's genuinely no monument anywhere within `BUILD_BANNER_RADIUS`.
+
+B. **Expand lateral search to radius 2.** When all 8 banner-neighbors are non-empty, search the ring at distance 2 before falling back. Prevents laterals from stacking onto existing tall towers and actually grows the monument footprint outward.
+
+Do A first \u2014 it may make B unnecessary if the founder chain was the primary driver. Re-run the 15-dot test, read the log, decide if B is still needed.
+
+### Files Touched
+- `main.gd`: 80/20 stack fix, `STACK_HEIGHT_SOFTCAP` scaling, `_pick_lateral_cell`, `_count_walls_in_cell`, test-mode infrastructure (`TEST_MODE`, `_log`, `_spawn_test_population`, `_next_dot_id`, `_tick_num`, log calls in `_tick_dot` and `_create_wall`)
+- `build_log.txt`: created (game runtime output, gitignore candidate)
+- `DEVNOTES.md`: this file

@@ -19,3 +19,6 @@ package-lock.json
 
 # Live chant bridge
 chant.json
+
+# Test-mode build mechanic telemetry
+build_log.txt
