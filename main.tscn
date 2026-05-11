@@ -110,3 +110,13 @@ offset_top = 12.0
 offset_right = 300.0
 offset_bottom = 120.0
 text = "dots: 0"
+
+[node name="ZoomSlider" type="VSlider" parent="UI" unique_id=1639998854]
+offset_left = 30.0
+offset_top = 100.0
+offset_right = 50.0
+offset_bottom = 300.0
+min_value = 1.12
+max_value = 3.0
+step = 0.01
+value = 3.0

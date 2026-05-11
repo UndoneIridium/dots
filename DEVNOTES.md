@@ -375,3 +375,73 @@ Future work, recorded for continuity:
 - p1 keeps using fog color even after contact (testing override)
 - HUD shows combined CCE across all colonies — should separate per-colony
 - Combat is deterministic (a + d power compared, ties to attacker) — probabilistic combat discussed but not implemented; would interact with dilution and noise floor at high generations
+
+
+
+---
+
+## Session Notes — continued (post-rally / build-banner work)
+
+### Testing Iteration on Build Mechanic
+
+After first build implementation, observed:
+- Walls were forming as lines, not monuments
+- Stacking wasn't happening visually
+- Builders were placing into 8-neighbors rather than clustering
+
+Iterated through several changes:
+
+1. **First iteration — 8-neighbor scatter with attraction radius**: Builders scanned 8 neighbors, preferred placing in cells adjacent to existing same-colony walls, with a wider 3-cell attraction radius for isolated builders. Produced lines, not monuments.
+
+2. **Second iteration — build banners with 8-neighbor placement**: Added `build_banners` (separate from rally `banners`) with `BUILD_BANNER_RADIUS = 15`, `BUILD_BANNER_TTL = 6`, `BUILD_START_CHANCE = 0.05`. Builders rolling build_upward find nearest unused banner in radius and march to it; if no banner, 5% chance to start one. Per-dot `build_banners_used` set prevents re-using same banner. Still produced lines.
+
+3. **Third iteration — build in own cell**: Changed both founder and follower to build in their own cell. Removed all 8-neighbor scattering. Added `WALL_HEIGHT_STEP` and stack_index tracking — each new wall in a cell renders at `radius + offset + stack_index * WALL_HEIGHT_STEP`. Active monuments refresh decay on all walls in the cell when a new one is added (abandoned ones decay top-down). Monuments started forming, BUT still produced vertical lines aligned with sphere poles.
+
+### Diagnosis of Vertical Line Pattern
+
+The vertical-line bias (lines always grow toward poles, never east-west) is structural:
+
+- Player dot spawns at the equator (`y = 0`)
+- Colony grows from there via wander
+- When a dot trips the 5% founder roll, it's wherever it happened to be in the spread cloud
+- Follower dots roll build elsewhere in the cloud and march toward the banner
+- Most followers approach the banner from the direction of the colony center
+- Since the spawn cloud is roughly equatorial, founders tend to be slightly north or south of the cloud's centroid
+- Followers therefore approach the banner from a consistent direction (pole-ward → equator-ward, or vice versa)
+- When a follower's `_is_at_or_adjacent` check returns true, they're typically in the cell on the approach-side of the banner
+- They `_create_wall(my_cell, my_colony)` — their *own* cell, which is 1 step away from the banner in the approach direction
+- Next follower arrives, lands in the same cell (now occupied by a wall, but they're a dot not a wall so they can co-exist), builds in own cell again — stacks the lateral
+- Result: a line extending from the banner toward the colony center, growing pole-ward because of the equatorial spawn
+
+The implementation drifted from the original spec. Original spec was "80/20 stack vs lateral" — but "stack" meant "build at the banner cell" not "build in own cell which happens to be the banner cell sometimes." Builders standing adjacent to the banner build in their *own* cell (lateral), so they essentially never stack the founder block.
+
+### Proposed Fix (UNRESOLVED — START HERE NEXT SESSION)
+
+When a builder is at_or_adjacent to a banner:
+- 80% of the time: build at the **banner cell** itself (stacks on founder block — vertical growth)
+- 20% of the time: build in the **builder's own cell** (lateral spread in a random direction, since followers arrive from different angles)
+
+This should produce real monuments: tall columns with occasional horizontal protrusions. The protrusions are in random directions because of natural variance in which builders trigger the 20% roll.
+
+Implementation: change `_execute_build` so the at-banner case does:
+```
+if randf() < BUILD_AT_BANNER_STACK_PREF:
+    _create_wall(banner_cell, my_colony)
+else:
+    _create_wall(my_cell, my_colony)
+```
+
+This matches the original 80/20 spec intent and decouples build placement from approach direction.
+
+### UI: Manual Zoom Slider
+
+Added a VSlider node (`UI/ZoomSlider`) for trackpad-zoom workaround on macOS:
+- Range: 1.12 (closest) to 3.0 (starting/farthest)
+- Vertical orientation, top-left of HUD
+- Wired bidirectionally: trackpad/scroll updates slider via `set_value_no_signal`, slider drag updates `zoom_target` directly
+- `ZOOM_MAX = 6.0` retained in code but unreachable via slider (cap is 3.0)
+
+### Files Touched
+- `main.gd`: rally banners, build primitive, build banners, wall stacking, zoom slider wiring
+- `main.tscn`: added `UI/ZoomSlider` (VSlider)
+- `DEVNOTES.md`: this file

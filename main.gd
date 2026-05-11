@@ -191,6 +191,7 @@ const COLONY0_CCE = {
 @onready var cancel_button = $UI/ChantModal/VBox/ButtonRow/CancelButton
 @onready var dev_bar = $UI/DevBar
 @onready var hud = $UI/HUD
+@onready var zoom_slider = $UI/ZoomSlider
 
 var zoom_target = 3.0
 var zoom_distance = 3.0
@@ -216,6 +217,8 @@ func _ready():
 	chant_input.text_submitted.connect(_on_chant_submitted)
 	dev_bar.placeholder_text = "dev chant..."
 	dev_bar.text_submitted.connect(_on_dev_chant)
+	zoom_slider.value = zoom_target
+	zoom_slider.value_changed.connect(_on_zoom_slider_changed)
 
 func _open_chant():
 	chant_modal.visible = true
@@ -1058,6 +1061,11 @@ func _input(event):
 
 func _zoom(delta: float):
 	zoom_target = clamp(zoom_target + delta, ZOOM_MIN, ZOOM_MAX)
+	if zoom_slider:
+		zoom_slider.set_value_no_signal(zoom_target)
+
+func _on_zoom_slider_changed(value: float):
+	zoom_target = clamp(value, ZOOM_MIN, ZOOM_MAX)
 
 func _place_dot_on_sphere(dot: Node3D, direction: Vector3, check_foreign: bool = false) -> bool:
 	if check_foreign:
