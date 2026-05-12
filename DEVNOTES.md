@@ -503,3 +503,94 @@ Do A first \u2014 it may make B unnecessary if the founder chain was the primary
 - `main.gd`: 80/20 stack fix, `STACK_HEIGHT_SOFTCAP` scaling, `_pick_lateral_cell`, `_count_walls_in_cell`, test-mode infrastructure (`TEST_MODE`, `_log`, `_spawn_test_population`, `_next_dot_id`, `_tick_num`, log calls in `_tick_dot` and `_create_wall`)
 - `build_log.txt`: created (game runtime output, gitignore candidate)
 - `DEVNOTES.md`: this file
+
+
+
+---
+
+## Session Notes — 2026-05-12 (the "lines" were a rendering artifact)
+
+### What we thought was happening
+
+Coming into the session, the prior diagnosis blamed the `build_banners_used` cooldown for producing a founder chain — distinct founder towers each 1-2 cells from the last, reading as a "line." Plan A was to remove the cooldown.
+
+### What was actually happening
+
+Did the cooldown removal anyway (it's a real, independent bug — founders should be allowed back to refresh their own banner). Lines persisted.
+
+Then widened `_is_at_or_adjacent` from `dist_sq <= 2` (3×3) to `dist_sq <= 8` (~5×5) and switched the lateral branch from `_pick_lateral_cell` back to `my_cell`. Lines still persisted.
+
+Pulled the log and tabulated wall-counts per cell:
+
+```
+       114 115 116 117 118
+y=95    4   7  16   2   3
+y=96    8  10   8  11   1
+y=97    6  10  16  11   3
+y=98    6  13  16   2   2
+y=99    3   4   5  11   7
+```
+
+A perfect 5×5 footprint. No line. But the user was still seeing parallel "lines" with "one dot's distance" of space between them.
+
+The clue was the *exact* spacing: one dot wide.
+
+- Wall mesh: `0.015 × 0.003 × 0.015`
+- Cell spacing at the equator: `TAU/GRID_RES = TAU/200 ≈ 0.0314`
+- Wall footprint is exactly half a cell
+
+Adjacent cells with tall stacks render as adjacent pillars, each half a cell wide, with the other half-cell of empty space between them. Three adjacent stacked columns (x=115, 116, 117) read as three parallel rails separated by one-dot gaps. The "lines from two monuments would have met if extended" was also the same artifact — both monuments place walls on the same global lat/long grid, so the pillar-and-gap pattern aligns globally.
+
+It was never a build logic problem. The mechanic was actually working — the 5×5 grid above is genuinely circular-ish with spikes, which is the desired behavior. The rendering just hid it.
+
+### The fix
+
+Single-line change:
+
+```
+const WALL_MESH_SIZE = Vector3(0.031, 0.003, 0.031)  # match cell spacing
+```
+
+Walls now tile cleanly. Adjacent cells with walls touch. The 5×5 footprint reads as a solid monument with varied-height spikes instead of striped rails.
+
+### Cleanups also made
+
+- `build_banners_used` writes removed from `_execute_build` (both the at-banner and founder branches). The field is still initialized in `_create_dot` and still filtered in `_find_eligible_build_banner` — dormant plumbing, costs nothing, easy to re-enable if needed.
+- `_is_at_or_adjacent` widened to `dist_sq <= 8` so builders within ~2-3 cells of a banner participate. Reasonable on its own merits even though it wasn't the actual fix.
+- Lateral branch builds in `my_cell` instead of `_pick_lateral_cell(banner_cell)`. Restores the original 80/20 spec intent ("stack at banner / build where you stand"). `_pick_lateral_cell` and `_count_walls_in_cell` are now unused but retained.
+- TEST_MODE / LOG_ENABLED split: `TEST_MODE` controls the fixed 15-dot test population, `LOG_ENABLED` controls log writes. Lets us log organic runs without the test-population override. Currently `TEST_MODE = false`, `LOG_ENABLED = true`.
+
+### Visual scale observation (not addressed)
+
+Walls (0.031) are now visibly chunkier than dots (0.015) because the wall mesh now matches the cell, but the dot mesh is still half a cell. Three options discussed:
+
+1. Scale up the world (radius, grid_res, all meshes proportionally) — lots of camera retuning.
+2. Double `GRID_RES` to 400 so cell width ≈ dot width — clean, but every radius constant (`RALLY_RADIUS`, `BUILD_BANNER_RADIUS`, `ATTACK_DETECT_RADIUS`) is in cells and would need ~2× to preserve angular behavior.
+3. Leave it. Walls being chunkier reads as worldbuilding — dots are living, walls are constructed.
+
+Chose 3 for now. Easy to revisit if it starts looking wrong.
+
+### Lessons
+
+- Tabulating wall-cell counts as a 2D grid would have caught this in one minute on session start. Inferring spatial shape from chronological event logs missed the obvious cell-coordinate structure.
+- The wall-mesh-size assumption (half a dot's height, ergo half-cell footprint) was load-bearing in a way nobody had documented. Comment now says "match cell spacing."
+- Past-me's diagnoses across sessions had the right vibe (founders chain, approach bias) but the actual cause was downstream rendering. Build logic was probably fine after the iteration-3 fix; we've been iterating on a phantom.
+
+### Known Issues / TODO
+
+- gather/mark_surface primitives silently do nothing
+- No resource system / surface marking system
+- No multiplayer / server layer
+- CCE dilution still 0.7 — interacts non-trivially with reproduction
+- Defense banners and threat scoring unimplemented
+- Rider mechanic for stacked wall+dot unimplemented
+- HUD shows combined CCE across all colonies — should separate per-colony
+- Combat is deterministic — probabilistic combat discussed but not implemented
+- `_pick_lateral_cell` and `_count_walls_in_cell` are now dead code; remove on a future cleanup pass if confirmed unused
+- Wall mesh visual scale relative to dot mesh — left at chunky-walls for now
+
+### Files Touched
+
+- `main.gd`: WALL_MESH_SIZE bump, removed `build_banners_used` writes, widened `_is_at_or_adjacent`, lateral builds in own cell, TEST_MODE/LOG_ENABLED split
+- `DEVNOTES.md`: this file
+- `build_log.txt`: regenerated each session (gitignore candidate if not already)

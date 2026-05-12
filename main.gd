@@ -46,7 +46,7 @@ var colony_counts = {}  # colony_id -> current dot count
 # load-bearing across the codebase \u2014 will rename later.
 const WALL_DEFEND_VALUE = 0.5
 const WALL_DECAY_TICKS = 300
-const WALL_MESH_SIZE = Vector3(0.015, 0.003, 0.015)  # half a dot's height
+const WALL_MESH_SIZE = Vector3(0.031, 0.003, 0.031)  # match cell spacing so adjacent cells tile cleanly (TAU/GRID_RES \u2248 0.0314 at the equator)
 const WALL_HEIGHT_STEP = 0.003  # vertical spacing between stacked blocks (== mesh y-size)
 var wall_counts = {}  # colony_id -> current wall count
 
@@ -59,9 +59,11 @@ const STACK_HEIGHT_SOFTCAP = 10  # stack pref scales linearly to ~0 at this heig
 var build_banners = []  # [{id: int, cell: Vector2i, colony: int, ticks_remaining: int}]
 var _next_build_banner_id = 1
 
-# Test mode \u2014 fixed population, logs primitive rolls & wall placements to LOG_FILE
-const TEST_MODE = true
+# Test mode \u2014 fixed population (suppresses reproduction, seeds 15 dots)
+const TEST_MODE = false
 const TEST_POPULATION = 15
+# Logging \u2014 independent of TEST_MODE so we can log organic runs too
+const LOG_ENABLED = true
 const LOG_FILE = "res://build_log.txt"
 var _next_dot_id = 1
 var _tick_num = 0
@@ -215,7 +217,7 @@ var single_touch_index = -1
 var _cached_colony_center = Vector3.ZERO
 
 func _ready():
-	if TEST_MODE:
+	if LOG_ENABLED:
 		# Wipe log at session start
 		var f = FileAccess.open(LOG_FILE, FileAccess.WRITE)
 		if f:
@@ -409,7 +411,7 @@ func _tick_dot(dot: Node3D):
 			break
 	if chosen == "":
 		return
-	if TEST_MODE and dot_data[dot]["colony"] == LOCAL_COLONY:
+	if LOG_ENABLED and dot_data[dot]["colony"] == LOCAL_COLONY:
 		var cell = _cell_key(dot.position.normalized())
 		_log("[t%d] dot %d at (%d,%d) roll: %s" % [_tick_num, dot_data[dot]["dot_id"], cell.x, cell.y, chosen])
 	_execute_primitive(dot, chosen, cce["dials"])
@@ -512,11 +514,11 @@ func _execute_build(dot: Node3D):
 			var current_height = _count_walls_in_cell(banner_cell, my_colony)
 			var height_factor = clamp(1.0 - float(current_height) / float(STACK_HEIGHT_SOFTCAP), 0.0, 1.0)
 			var stack_pref = BUILD_AT_BANNER_STACK_PREF * height_factor
-			var build_cell = banner_cell if randf() < stack_pref else _pick_lateral_cell(banner_cell, my_colony)
+			var build_cell = banner_cell if randf() < stack_pref else my_cell
 			var reason_str = "stack" if build_cell == banner_cell else "lateral"
 			_create_wall(build_cell, my_colony, dot_data[dot]["dot_id"], reason_str)
 			_refresh_build_banner(nearest_banner["id"])
-			dot_data[dot]["build_banners_used"][nearest_banner["id"]] = true
+			# build_banners_used cooldown removed \u2014 was producing per-dot founder chains.
 		else:
 			# March toward the banner; do not build this tick
 			var banner_dir = _cell_to_dir(banner_cell)
@@ -526,12 +528,14 @@ func _execute_build(dot: Node3D):
 	if randf() >= BUILD_START_CHANCE:
 		return
 	_create_wall(my_cell, my_colony, dot_data[dot]["dot_id"], "founder")
-	var banner_id = _drop_build_banner(my_cell, my_colony)
-	# Founder is considered to have used this banner (so they don't get pulled back to it)
-	dot_data[dot]["build_banners_used"][banner_id] = true
+	_drop_build_banner(my_cell, my_colony)
+	# Founder may now return to refresh this banner on subsequent build rolls.
 
 func _is_at_or_adjacent(a: Vector2i, b: Vector2i) -> bool:
-	return _torus_cell_dist_sq(a, b) <= 2
+	# Wider than literal adjacency \u2014 lets builders within a ~5x5 area of the banner
+	# participate, so the lateral footprint reflects the cloud's natural shape
+	# instead of being clamped to the 8-neighbor ring.
+	return _torus_cell_dist_sq(a, b) <= 8
 
 func _find_eligible_build_banner(dot: Node3D, my_cell: Vector2i, my_colony: int):
 	if build_banners.is_empty():
@@ -582,7 +586,7 @@ func _create_wall(cell: Vector2i, colony: int, builder_id: int = -1, reason: Str
 		for occupant in spatial_grid[cell]:
 			if dot_data.has(occupant) and dot_data[occupant].get("is_wall", false):
 				stack_index += 1
-	if TEST_MODE and builder_id >= 0:
+	if LOG_ENABLED and builder_id >= 0:
 		_log("[t%d] wall: builder=%d cell=(%d,%d) reason=%s height=%d" % [_tick_num, builder_id, cell.x, cell.y, reason, stack_index])
 	# Refresh decay on existing walls in this cell so active monuments don't crumble
 	if spatial_grid.has(cell):
@@ -988,7 +992,7 @@ func _spawn_enemy_colony():
 	_create_dot(enemy_dir, null, ENEMY_COLONY, COLONY1_CCE)
 
 func _log(line: String):
-	if not TEST_MODE:
+	if not LOG_ENABLED:
 		return
 	var f = FileAccess.open(LOG_FILE, FileAccess.READ_WRITE)
 	if f == null:
