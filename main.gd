@@ -56,7 +56,12 @@ const BUILD_BANNER_TTL = 6
 const BUILD_START_CHANCE = 0.05  # chance a build_upward roll starts a new monument when no banner is in range
 const BUILD_AT_BANNER_STACK_PREF = 0.8  # base prob. of stacking when building at a banner (at height 0)
 const STACK_HEIGHT_SOFTCAP = 10  # stack pref scales linearly to ~0 at this height
-var build_banners = []  # [{id: int, cell: Vector2i, colony: int, ticks_remaining: int}]
+# Monument size cap. cap = BUILD_MONUMENT_BASE + BUILD_MONUMENT_SCALE * colony_avg_build_cce.
+# Snapshotted at founder placement and stored on the banner. Independent of population \u2014
+# big colonies just hit the cap faster, small ones may never reach it (banner times out).
+const BUILD_MONUMENT_BASE = 10.0
+const BUILD_MONUMENT_SCALE = 200.0
+var build_banners = []  # [{id, cell, colony, ticks_remaining, wall_cap, wall_count}]
 var _next_build_banner_id = 1
 
 # Test mode \u2014 fixed population (suppresses reproduction, seeds 15 dots)
@@ -517,8 +522,13 @@ func _execute_build(dot: Node3D):
 			var build_cell = banner_cell if randf() < stack_pref else my_cell
 			var reason_str = "stack" if build_cell == banner_cell else "lateral"
 			_create_wall(build_cell, my_colony, dot_data[dot]["dot_id"], reason_str)
-			_refresh_build_banner(nearest_banner["id"])
-			# build_banners_used cooldown removed \u2014 was producing per-dot founder chains.
+			nearest_banner["wall_count"] += 1
+			if nearest_banner["wall_count"] >= nearest_banner["wall_cap"]:
+				if LOG_ENABLED:
+					_log("[t%d] banner: id=%d completed at %d/%d walls \u2014 expiring" % [_tick_num, nearest_banner["id"], nearest_banner["wall_count"], nearest_banner["wall_cap"]])
+				nearest_banner["ticks_remaining"] = 0
+			else:
+				_refresh_build_banner(nearest_banner["id"])
 		else:
 			# March toward the banner; do not build this tick
 			var banner_dir = _cell_to_dir(banner_cell)
@@ -635,8 +645,33 @@ func _create_wall(cell: Vector2i, colony: int, builder_id: int = -1, reason: Str
 func _drop_build_banner(cell: Vector2i, colony: int) -> int:
 	var id = _next_build_banner_id
 	_next_build_banner_id += 1
-	build_banners.append({"id": id, "cell": cell, "colony": colony, "ticks_remaining": BUILD_BANNER_TTL})
+	var avg_build = _compute_colony_avg_build_cce(colony)
+	var wall_cap = int(round(BUILD_MONUMENT_BASE + BUILD_MONUMENT_SCALE * avg_build))
+	build_banners.append({
+		"id": id,
+		"cell": cell,
+		"colony": colony,
+		"ticks_remaining": BUILD_BANNER_TTL,
+		"wall_cap": wall_cap,
+		"wall_count": 0,
+	})
+	if LOG_ENABLED:
+		_log("[t%d] banner: id=%d cell=(%d,%d) cap=%d (avg_build=%.3f)" % [_tick_num, id, cell.x, cell.y, wall_cap, avg_build])
 	return id
+
+func _compute_colony_avg_build_cce(colony: int) -> float:
+	var total = 0.0
+	var count = 0
+	for dot in dots:
+		if dot_data[dot]["colony"] != colony:
+			continue
+		if dot_data[dot].get("is_wall", false):
+			continue
+		total += dot_data[dot]["cce"]["action"].get("build_upward", 0.0)
+		count += 1
+	if count == 0:
+		return 0.0
+	return total / count
 
 func _refresh_build_banner(id: int):
 	for banner in build_banners:

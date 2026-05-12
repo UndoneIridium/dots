@@ -589,6 +589,61 @@ Chose 3 for now. Easy to revisit if it starts looking wrong.
 - `_pick_lateral_cell` and `_count_walls_in_cell` are now dead code; remove on a future cleanup pass if confirmed unused
 - Wall mesh visual scale relative to dot mesh — left at chunky-walls for now
 
+
+
+---
+
+## Session Notes — 2026-05-12 (cont., monument size cap)
+
+### The stickiness problem
+
+Once a banner is dropped, every nearby builder refreshes its TTL on placement. With ~half the colony rolling `build_upward` and a dense cluster around the founder, TTL essentially never decrements — banner is immortal. Result: the colony develops a magnet for the first monument site and never spreads.
+
+### Approach: cap monument size by CCE, throughput by population
+
+User's framing: cap should reflect the colony's *build character* (CCE alone), not population. A small population just takes longer to fill the cap, or never reaches it before the banner times out. A large population fills it fast and moves on. This expresses what the colony "wants to build."
+
+Decided on a per-banner wall count cap. When count hits cap, banner expires immediately (TTL → 0). Builders downstream search for other banners or fall through to the 5% founder roll, naturally redistributing the colony spatially.
+
+### Implementation
+
+- `BUILD_MONUMENT_BASE = 10.0`, `BUILD_MONUMENT_SCALE = 200.0`
+- `_compute_colony_avg_build_cce(colony)` averages `build_upward` across **all** living non-wall dots of the colony (entire population, not just active builders — selection bias would inflate the snapshot)
+- At founder placement (`_drop_build_banner`), snapshot `wall_cap = round(BASE + SCALE * avg_build)` into the banner
+- Banner now has `wall_cap` and `wall_count` fields
+- In `_execute_build` at-banner branch: after `_create_wall`, increment `wall_count`. If it hits cap, expire the banner instead of refreshing
+- Logging on banner creation and expiry, includes cap and avg_build snapshot
+
+Cap numbers:
+- avg=0.10 → cap=30
+- avg=0.40 (current `COLONY0_CCE` preset) → cap=90
+- avg=0.80 → cap=170
+
+### Test plan (next session)
+
+Three things to validate, in order:
+
+1. **Does the cap fire?** With dilution still off (full_inheritance true for organic spawns), all dots stay at build=0.40 indefinitely, every banner gets cap=90. First monument should hit 90 walls and expire. Founders should fire in new locations. Run and watch logs for `banner: id=X completed at 90/90 walls — expiring` events.
+
+2. **Does the cap scale with CCE?** Re-enable dilution (flip `full_inheritance` back to `false` in `_spawn_dot_near`). avg_build erodes over generations toward zero. Each successive banner should have a smaller cap. Eventually founders rarely fire because caps approach zero and dilution overcomes spawn CCE.
+
+3. **Does chant counter dilution?** Add `build`/`construct` chants to `CHANT_RECIPES` (currently absent — past devnotes flagged this as a deliberate omission while build was unwired, but build is wired now). Chanting `build` adds `CHANT_WEIGHT = 0.08` to every living dot's build_upward, fighting dilution and pumping cap back up.
+
+Doing (1) first in isolation lets us confirm the cap mechanic works without dilution as a confound.
+
+### Files touched
+
+- `main.gd`: BUILD_MONUMENT_BASE/SCALE constants, banner cap/count fields, `_compute_colony_avg_build_cce` helper, cap-check in `_execute_build`, log lines on banner create/expire
+- `DEVNOTES.md`: this file
+
+### Known issues / TODO
+
+- Build chant recipes still missing — needed for test (3) and for player to actually influence monument size at runtime
+- `_pick_lateral_cell` and `_count_walls_in_cell` still present as dead code (the lateral helper isn't called; the count helper is still used for stack-height softcap calculation, keep it)
+- gather/mark_surface primitives still no-ops
+- No monument_id on walls yet — wanted this in this session but bumped for next. Banner has an id and now a cap, walls don't carry it through. Easy add when needed for lineage queries.
+- Dilution still off by default (full_inheritance true in `_spawn_dot_near`) — flip when ready for test (2)
+
 ### Files Touched
 
 - `main.gd`: WALL_MESH_SIZE bump, removed `build_banners_used` writes, widened `_is_at_or_adjacent`, lateral builds in own cell, TEST_MODE/LOG_ENABLED split
