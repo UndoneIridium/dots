@@ -648,4 +648,125 @@ Doing (1) first in isolation lets us confirm the cap mechanic works without dilu
 
 - `main.gd`: WALL_MESH_SIZE bump, removed `build_banners_used` writes, widened `_is_at_or_adjacent`, lateral builds in own cell, TEST_MODE/LOG_ENABLED split
 - `DEVNOTES.md`: this file
+
+
+---
+
+## Session Notes — 2026-05-12 (cont., end-of-session discussion: wall mesh variants)
+
+No code changed in this segment. Capturing the discussion thread so it survives the session boundary.
+
+### Reframe: build was always about combat defense
+
+The original intent for the build primitive was **walls during combat**, not monuments. Monuments are what build-CCE dots do when no enemy is around — a side effect of having a primitive with no immediate threat to respond to. We spent the last several sessions getting monument behavior to work, which validates the primitive's mechanics, but the *gameplay* purpose is fortification under attack. Easy to lose sight of with no enemy colony spawned.
+
+### Idea: blocks have varying mesh sizes by context
+
+Trigger: user observed that the old skinny mesh (0.015) was nice-looking *for a wall* and bad for a monument block. What if both exist?
+
+Discussed three variants, in increasing ambition:
+
+**Variant 1 — two block types, decided at placement.**
+- Defense block: thin/long mesh, e.g. `(0.031, 0.003, 0.008)`. Placed when a build roll fires inside a rally banner's radius (combat context).
+- Monument block: full-cell mesh `(0.031, 0.003, 0.031)`. Placed when no rally banner is in range (peaceful build).
+- Same `is_wall: true`, same combat math, just a `mesh_variant` field on the wall.
+
+**Variant 2 — block dimensions scale with CCE.**
+- Mesh size correlates with build CCE concentration in the local cloud.
+- High concentration → thicker walls, sparse → thinner.
+- Several tunable axes, harder to read at a glance. Probably not v1.
+
+**Variant 3 — blocks have orientation, not just footprint.**
+- Defense block is a thin slab perpendicular to the threat vector.
+- Multiple defense blocks join into a continuous wall facing the enemy.
+- Flanking a wall means hitting its short edge.
+- Coolest version, also the most geometry work (corners, joining, orientation tracking).
+
+### Lean: variant 1 for v1
+
+Smallest readable change. Rally banner infrastructure already tracks "is combat happening here," so the routing is nearly free. Slots into the original Step 2 design — instead of rally banners *suppressing* build_upward in combat, they *redirect* it to defense walls. The colony doesn't lose its action during combat; it expresses it as fortification.
+
+### Mechanical pairing that fell out of the discussion
+
+If defense walls don't stack and only spread laterally, while monument blocks stack but don't spread as aggressively, the *mechanical* difference matches the *visual* difference matches the *gameplay* difference:
+
+- Defense walls: horizontal line, covers ground, urgent
+- Monument blocks: vertical pillar, concentrates, leisurely
+
+A colony that has lived through combat will have both side by side — old monuments from peaceful times, defense walls from when the enemy came. Terrain becomes a record of the colony's history. Worldbuilding for nearly free.
+
+### Open questions parked for later
+
+- Do defense walls and monument blocks coexist in the same cell? Probably not — different cells, different purposes.
+- What happens to a defense wall after the threat is gone? Decays? Stays as a permanent fortification? Becomes a monument block?
+- Wall orientation (variant 3) is appealing — revisit once variant 1 is in and we see how walls feel.
+
+### Backend / scale anxiety check-in
+
+User raised this and we talked through it briefly. Summary: the client is the design tool. Every mechanic we test locally either survives (and becomes a server requirement) or dies (and saves us server work). The right time for a server-shape sketch is after the next playable slice — combat + build + cap, with both colonies live. Then we write a one-pager on server responsibilities, tick model, message protocol, sharding. For now: keep going on game mechanics.
+
+### Next session
+
+Test plan from earlier in the session still stands. In order:
+
+1. Validate cap fires (dilution off, all caps ≈ 90, banners expire on completion, founders fire elsewhere)
+2. Re-enable dilution, watch caps shrink generation over generation
+3. Add `build` / `construct` chant recipes, confirm chant counters dilution and bumps caps
+
+Then revisit wall mesh variants once we have an enemy colony in play to actually exercise the combat-build pathway.
+
 - `build_log.txt`: regenerated each session (gitignore candidate if not already)
+
+
+
+---
+
+## Session Notes — 2026-05-13 (cap validation, overshoot fix, build rate observation)
+
+### Test 1: cap fires (PASSED)
+
+Ran with dilution off (full_inheritance true) and the per-monument cap as shipped last session. All 18 founders over 85 ticks placed at avg_build=0.400 → cap=90, as expected. The redistribution loop works: when a banner hits cap, builders within radius dry up, fall through to the 5% founder roll, and new monuments start elsewhere.
+
+### Overshoot bug (caught, fixed)
+
+First run of test 1 surfaced an issue from the existing log without needing a fresh session: every banner overshot its cap by 8–24 walls on the cap-hit tick. Mechanism: `_execute_build`'s cap branch sets `banner["ticks_remaining"] = 0`, but the banner stays in the array until `_tick_build_banners()` cleans it up next tick. Within the current tick, every remaining builder who rolls `build_upward` still finds the banner via `_find_eligible_build_banner`, builds another wall, re-trips the cap check, and re-logs "expiring."
+
+One-line fix: added `if banner["ticks_remaining"] <= 0: continue` to the eligibility loop. Banners marked for expiry are now invisible to lookup for the rest of the tick; cleanup still happens via the normal TTL decrement next tick. No state machine surface added — the immediate-removal alternative would have required tracking array indices and creating two exit paths.
+
+Validation: rerun showed each banner with exactly one expire log line at exactly 90/90 walls. Zero overshoot.
+
+### Spatial behavior at avg_build=0.40
+
+After fix, tabulated 18 founders across 85 ticks. Footprint of all walls: 9×27 cells, with the main mass tightly clustered around the original founder. 14 of 18 founders fell within ~10 cells of the first one — they're not "starting farther away," they're starting *inside the previous monument's footprint*, because the 5% founder roll fires from wherever the builder happens to be standing, and builders cluster around the cell they were just at.
+
+Two visible clusters emerged: a large mass at y=88–101 and a smaller one at y=109–114, separated by an 8-row gap of zeros. The southern cluster started at t64 when one wandering dot got far enough from the main cloud to be alone when its founder roll fired — a rare event, but the actual redistribution mechanism in action.
+
+Cell wall counts at the hot spots: (11,92)=77, (10,94)=70, (10,92)=54, (10,95)=51, (10,91)=51. Stacks max around 77 because `STACK_HEIGHT_SOFTCAP=10` decays stack pref toward zero, so once a tower is height ~10 the builders are essentially all going lateral. Lateral:stack:founder ratio over the run was 1387:139:18 (~90:9:1).
+
+### Build rate observation
+
+**Even at build=0.40, build rate is faster than desired.** 1544 walls placed across 85 ticks with a single colony. The blending-into-cities effect the user noted is downstream of this — many overlapping monument footprints stacking up in the same general area. Tuning levers identified but not exercised:
+
+- `BUILD_BANNER_RADIUS = 15` — smaller would make builders give up sooner and fall through to founder roll, dispersing the colony spatially.
+- `BUILD_START_CHANCE = 0.05` — controls how often a "no banner in range" builder actually starts a new one.
+- Anti-clustering check on founder placement — refuse founder if within some radius of an existing recent banner.
+- Lowering `COLONY0_CCE.build_upward` from 0.40.
+
+Tests 2 (re-enable dilution) and 3 (build chants) are deferred. Decision: pivot to **combat wall mechanic** next session — the original gameplay purpose of build_upward — rather than continue monument tuning.
+
+### Files touched
+
+- `main.gd`: added `ticks_remaining <= 0` skip in `_find_eligible_build_banner`
+- `DEVNOTES.md`: this file
+
+### Known issues / TODO
+
+- Build rate at build=0.40 is faster than desired — tuning deferred until combat walls give us a reason to revisit
+- Founders cluster inside dead monument footprints — no anti-clustering check yet
+- Tests 2 (dilution generational decay) and 3 (build chant counter) skipped — pivot to combat walls instead
+- Build chant recipes still missing
+- `_pick_lateral_cell` still dead code (`_count_walls_in_cell` is live — used by stack-height softcap)
+- gather/mark_surface primitives still no-ops
+- HUD shows combined CCE across all colonies — should separate per-colony
+- Combat is deterministic — probabilistic variant discussed but not implemented
+- No monument_id on walls yet

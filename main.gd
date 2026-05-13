@@ -556,6 +556,8 @@ func _find_eligible_build_banner(dot: Node3D, my_cell: Vector2i, my_colony: int)
 	for banner in build_banners:
 		if banner["colony"] != my_colony:
 			continue
+		if banner["ticks_remaining"] <= 0:
+			continue
 		if used.has(banner["id"]):
 			continue
 		var d = _torus_cell_dist_sq(my_cell, banner["cell"])
