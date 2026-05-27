@@ -80,6 +80,9 @@ const DOT_SURFACE_OFFSET = 0.0075
 const PARALLEL_EPSILON = 0.0001
 const MAX_CCE_FOR_SATURATION = 1.5
 
+const OBSERVE_BASE_RADIUS := 3
+const OBSERVE_SCALE := 20
+
 const NEUTRAL_CCE = {
 	"motion": {
 		"wander": 0.0,
@@ -93,7 +96,8 @@ const NEUTRAL_CCE = {
 		# Active primitives
 		"defend": 0.0,
 		"attack": 0.0,
-		"reproduce": 0.0
+		"reproduce": 0.0,
+		"observe": 0.0
 	},
 	"dials": {
 		"range": 0.5,
@@ -109,6 +113,7 @@ const CCE_COLORS = {
 	"defend": Color(0.2, 0.5, 1.0),
 	"attack": Color(1.0, 0.2, 0.2),
 	"build_upward": Color(0.6, 0.6, 0.7),
+	"observe": Color(0.7, 0.3, 0.9),
 }
 const CCE_NEUTRAL_COLOR = Color(1.0, 1.0, 1.0)
 
@@ -129,6 +134,9 @@ const CHANT_RECIPES = {
 	"defend":    { "action": { "defend": CHANT_WEIGHT } },
 	"protect":   { "action": { "defend": CHANT_WEIGHT } },
 	"guard":     { "action": { "defend": CHANT_WEIGHT } },
+	"observe":   { "action": { "observe": CHANT_WEIGHT } },
+	"watch":     { "action": { "observe": CHANT_WEIGHT } },
+	"see":       { "action": { "observe": CHANT_WEIGHT } },
 	"far":       { "dials": { "range": 0.1 } },
 	"farther":   { "dials": { "range": 0.1 } },
 	"distant":   { "dials": { "range": 0.1 } },
@@ -170,7 +178,8 @@ const COLONY1_CCE = {
 		"gather": 0.0,
 		"defend": 0.0,
 		"attack": 0.40,
-		"reproduce": 0.32
+		"reproduce": 0.32,
+		"observe": 0.1
 	},
 	"dials": {
 		"range": 0.5,
@@ -189,7 +198,8 @@ const COLONY0_CCE = {
 		"gather": 0.0,
 		"defend": 0.0,
 		"attack": 0.0,
-		"reproduce": 0.40
+		"reproduce": 0.40,
+		"observe": 0.1
 	},
 	"dials": {
 		"range": 0.5,
@@ -452,6 +462,8 @@ func _execute_primitive(dot: Node3D, primitive: String, dials: Dictionary):
 			_place_dot_on_sphere(dot, new_dir, true)
 		"build_upward":
 			_execute_build(dot)
+		"observe":
+			_execute_observe(dot)
 		# gather, mark_surface, face_target: reserved \u2014 no-op
 
 func _execute_attack(dot: Node3D, intensity: float):
@@ -540,6 +552,17 @@ func _execute_build(dot: Node3D):
 	_create_wall(my_cell, my_colony, dot_data[dot]["dot_id"], "founder")
 	_drop_build_banner(my_cell, my_colony)
 	# Founder may now return to refresh this banner on subsequent build rolls.
+
+func _execute_observe(dot: Node3D) -> void:
+	var observe_weight = dot_data[dot]["cce"]["action"].get("observe", 0.0)
+	var radius = int(OBSERVE_BASE_RADIUS + OBSERVE_SCALE * observe_weight)
+	var pending = dot_data[dot]["pending_observe"]
+	if pending != null and pending["expires_on_tick"] <= _tick_num:
+		dot_data[dot]["pending_observe"] = null
+	var my_dir = dot.position.normalized()
+	var my_colony = dot_data[dot]["colony"]
+	var result = _find_nearest_foreign_in_radius(my_dir, my_colony, radius)
+	dot_data[dot]["pending_observe"] = { "enemy": result, "expires_on_tick": _tick_num + 1 }
 
 func _is_at_or_adjacent(a: Vector2i, b: Vector2i) -> bool:
 	# Wider than literal adjacency \u2014 lets builders within a ~5x5 area of the banner
@@ -1109,7 +1132,7 @@ func _create_dot(direction: Vector3, parent, colony: int = LOCAL_COLONY, preset_
 			if parent_cce["dials"].has(key):
 				cce["dials"][key] = parent_cce["dials"][key] * dilution
 
-	dot_data[dot] = { "age": 0, "cce": cce, "colony": colony, "build_banners_used": {}, "dot_id": _next_dot_id }
+	dot_data[dot] = { "age": 0, "cce": cce, "colony": colony, "build_banners_used": {}, "dot_id": _next_dot_id, "pending_observe": null }
 	_next_dot_id += 1
 	known_colonies[colony] = true
 	colony_counts[colony] = colony_counts.get(colony, 0) + 1
