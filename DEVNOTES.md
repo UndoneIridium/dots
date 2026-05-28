@@ -984,3 +984,40 @@ The `collect_lock` resolution currently does nothing beyond removing the speck. 
 - Universal vs. selective soul consumption: does every `build_upward` roll cost soul, or only specific acts (e.g. founding a monument, not stacking)?
 - Monument soul-generation snowball balance: if monuments generate soul and build consumes it, a large monument advantage compounds. Needs a cap or decay mechanism.
 - Whether `wander` should be the incidental collection path or whether collection should require an explicit `gather` roll to keep primitives semantically clean.
+
+### Shipped: colony-level soul pool (commit 0e21e24)
+
+- `var soul_pool = {}` declared alongside `colony_counts` and `wall_counts` — same `colony_id → int` dict, same lazy-init pattern (`.get(colony, 0)` on every read and write, no explicit pre-init).
+- Increment inserted in `_tick_all_dots` collect-lock resolution path, **outside** the `if lock["speck"] in specks:` block — fires for every resolved lock regardless of whether the speck was still present. Simultaneous arrivers each credit their own colony's pool. The lock is the receipt.
+- HUD first line extended: `"p0: %d (walls: %d, soul: %d)   p1: %d"`. Empty-dots and wiped-out early-return paths deliberately unchanged — soul is silent when the colony is absent or wiped.
+- No spending logic. Pool accumulates freely.
+
+### Design clarification: enemy/NPC colonies are a testing fixture
+
+Enemy colonies are not a permanent game element. Multi-population dynamics (combat, exchange, plunder) are between actual player-controlled colonies, not human-vs-NPC. This shapes everything downstream: the "monument soul-generation snowball" and "exchange equalizes pools" design notes both assume parity between colonies. Enemy soul is not displayed in the HUD; display will be added when inter-population soul movement (exchange, plunder) is implemented.
+
+### Implementation note: multi-line git commit messages via OS.execute
+
+`OS.execute("git", ["commit", "-m", msg], output, true)` silently drops multi-line messages — exits 0, empty output, no commit created. Reliable path: write the message to a temp file and use `git commit -F <tempfile>`, then delete the file. Observed and confirmed this session.
+
+---
+
+## START HERE NEXT SESSION
+
+Resource system is complete enough for design work on the primitives. Specks spawn, dots collect, colonies accumulate. The next stage is **not** another resource feature — it's revisiting the primitive set in light of the working resource system.
+
+The North Star report's Tier 1 verb set is the reference:
+`move, gather, build, reproduce, exchange, teach, ritualize, defend, attack, incorporate`
+
+Adoption is incremental. Likely flow for the next session:
+1. Design discussion: which existing primitives map cleanly to North Star verbs, which need to be added, which need refactoring.
+2. Identify the smallest first primitive-layer change.
+3. Implement only that change — no sweeping refactor.
+
+**Still-open design questions (unchanged from earlier this session):**
+- Spawn rate / world supply cap for soul specks.
+- Universal vs. selective soul consumption across primitives.
+- Monument soul-generation snowball balance (cap or decay mechanism needed).
+
+**New open question for the primitive work:**
+Dots are heavily occupied by build-banner activity, so collection rate is low. This was acceptable when the pool had no effect, but may need revisiting once primitives actually consume soul — a colony that can never collect enough soul to act is a dead design.
