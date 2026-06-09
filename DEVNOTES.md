@@ -1148,3 +1148,43 @@ Wire the move case in `_execute_primitive` to check `pending_observe`, match aga
 	
 	(Mid-session environment hiccup: Claude Code's terminal lost OS-level filesystem access (macOS TCC) before the first attempt; the Godot editor process retained access. Resolved by restarting the Code session. No code impact.)
 	
+	
+	---
+	
+	## Session Notes — 2026-06-09 (cont., refactor catalog + landmine comment pass)
+	
+	### Refactor-candidate inspection (no edits)
+	
+	Ran an inspection-only refactor-candidate pass over `main.gd` (catalog produced in chat, not committed). Triaged into do-now-safe (Tier A) / defer (Tier B, no behavioral-equivalence harness exists) / never-touch (intentional) / needs-decision. Key rule reaffirmed: behavioral equivalence is unverifiable cheaply here (no test suite, stochastic per-tick sim), so only inspection-obvious changes (comments, renames, constant promotion) are in scope; dedups/extractions deferred until we're in that code functionally or build a seeded-RNG tally harness.
+	
+	### Shipped: landmine comment pass (comments only, zero executable change)
+	
+	Documented load-bearing assumptions at their code sites and fixed stale/half-true comments. `validate_script` clean; `git diff` confirmed comments-only. Sites:
+	- `dot_data` schema comment rewritten to the real live-dot record + wall-record variant (was 3 fields, stale).
+	- collect-lock resolution: "the lock is the receipt" — credit is outside the speck-in-specks check on purpose.
+	- `CCE_DILUTION`: birth-time / between-generations only, never within a lifetime; **currently inert** because `_spawn_dot_near` passes `full_inheritance=true` (testing posture).
+	- Newborn append-during-`for-in` in `_tick_all_dots` is intentional (newborns tick same pass), not a hazard.
+	- `_process` tick-order constraints (specks→dots, combat→dots, age→center).
+	- `ticks_remaining <= 0` skip in `_find_eligible_build_banner` is the cap-overshoot fix, not routine filtering.
+	- Exact-cell vs 3x3 foreign-check granularity rationale (march-to-the-line vs separation).
+	- Box (non-wrapping) vs torus distance metric — accepted choice.
+	- `player_dot` fallback may resolve to a wall/enemy dot (harmless today).
+	- `_remove_dot` synchronous-removal note mirrored onto the function.
+	- `_pick_lateral_cell` marked intentionally-retained dead code (+ the only correct `+ GRID_RES` seam-wrap idiom).
+	- `build_banners_used` marked dormant (never written).
+	- Reserved-list comment reworded: gather has no match-case executor but its weight is NOT inert — it gates directed move via `OBSERVE_MOVE_MAP`.
+	
+	### Parked for combat-walls pre-work (NOT fixed — functional, out of cleanup scope)
+	
+	Two functional findings surfaced by the inspection, both confirmed by reading the actual code (not just hypotheses), both near-zero incidence today (single equatorial colony, no combat), both landing exactly where the combat-walls work will:
+	
+	- **F1 — collect_lock can stall a dot until age-death.** In `_tick_all_dots`, the `continue` runs whenever `collect_lock != null` but the lock is only cleared on the `until_tick == _tick_num` branch. If that resolution tick is skipped because `combat_locked` fired first that tick, the lock is never cleared and the dot skips `_tick_dot` every subsequent tick (still ages, dies at DOT_LIFETIME). DEVNOTES 2026-05-28 describes the *intended* behavior as "clear without removing"; the code does not do that. Decide intended semantics, then fix — when combat work begins, verify with a repro first.
+	- **F2 — negative-modulo seam gap.** Neighborhood scans use `(key.x + du) % GRID_RES` with negative `du`; GDScript `%` truncates (`-1 % 200 == -1`), which never matches a 0..199 grid key, so 3x3/radius scans silently see nothing across the u=0/199 seam. `_pick_lateral_cell` and `_torus_cell_dist_sq` wrap correctly (`+ GRID_RES`). Affects foreign-blocking and enemy detection at the seam. (Separately: torus-wrapping the v axis is geometrically wrong — v=0 and v=199 are near opposite poles.) Verify + decide before combat work.
+	
+	### Remaining cleanup queue (do-now-safe, not yet done)
+	
+	- N1: rename `banners` -> `rally_banners` (4 touchpoints) — kills the `banners`(rally) vs `pending_observe["banner"]`(build) reader trap.
+	- M1–M5: promote magic numbers to constants (esp. `SPECK_SPAWN_CHANCE`, an open tuning lever currently a literal).
+	
+	Deferred: all Tier B dedups/extractions (U1/U4/U5/U6/U7/U8/T1), N4 wall->block mass rename (project-parked), low-value constants/notes. Dropped: L11 (colony-center-includes-walls is a gameplay-design question, not cleanup).
+	

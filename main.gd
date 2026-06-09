@@ -13,6 +13,9 @@ var tick_timer = 0.0
 
 const USE_SERVER = false
 const DOT_LIFETIME = 100
+# Children inherit this fraction of parent CCE at birth (between generations only,
+# never applied within a dot's lifetime). Currently inert: _spawn_dot_near passes
+# full_inheritance=true (testing posture, DEVNOTES 2026-05-12 "flip when ready").
 const CCE_DILUTION = 0.7
 const CHANT_WEIGHT = 0.08
 const CHANT_FILE = "res://chant.json"
@@ -159,11 +162,20 @@ const CHANT_RECIPES = {
 var dots = []
 var dot_data = {}
 var specks = []
+# Live-dot record (see _create_dot):
 # dot_data[dot] = {
-#   "age": int,           # ticks lived, dies at DOT_LIFETIME
-#   "colony": int,        # colony ID
-#   "cce": { "motion": {...}, "action": {...}, "dials": {...} }
+#   "age": int,                 # ticks lived, dies at DOT_LIFETIME
+#   "cce": { "motion": {...}, "action": {...}, "dials": {...} },
+#   "colony": int,              # colony ID
+#   "build_banners_used": {},   # dormant: never written (see _find_eligible_build_banner)
+#   "dot_id": int,              # stable id for logging
+#   "pending_observe": null,    # set by _execute_observe; consumed by move via OBSERVE_MOVE_MAP
+#   "collect_lock": null,       # set on speck-cell collision; resolved in _tick_all_dots
 # }
+# Wall-record variant (see _create_wall): "age", "cce", "colony", plus
+#   "is_wall": true, "decay_ticks_remaining": int, "stack_index": int. Its cce is a
+#   NEUTRAL copy with action.defend = WALL_DEFEND_VALUE. Walls carry none of
+#   dot_id / pending_observe / collect_lock / build_banners_used.
 
 var player_dot = null
 const LOCAL_COLONY = 0
@@ -288,6 +300,12 @@ func _process(delta):
 	if tick_timer >= TICK_SPEED:
 		tick_timer = 0.0
 		_tick_num += 1
+		# Tick order is load-bearing:
+		#  - _age_dots before _compute_colony_center: dead dots are excluded from the center.
+		#  - _tick_combat_clusters before _tick_all_dots: combat resolves and sets
+		#    combat_locked before dots roll, so locked dots skip their primitive this tick.
+		#  - _tick_specks before _tick_all_dots: specks spawned this tick are collidable
+		#    in the same tick (same-tick collectability).
 		_check_chant_file()
 		_age_dots()
 		# Spatial grid is now incrementally maintained \u2014 no rebuild needed
@@ -403,6 +421,10 @@ func _process_chant_locally(text: String):
 # --- Per-dot CCE tick ---
 
 func _tick_all_dots():
+	# Load-bearing: reproduce appends newborns to `dots` mid-iteration, and those newborns
+	# are intended to tick in this same pass. Dot removal never happens inside this loop
+	# (deaths are collected by _age_dots / combat resolution), so append-during-for-in is
+	# safe here, not a hazard.
 	for dot in dots:
 		if combat_locked.has(dot):
 			continue
@@ -414,6 +436,9 @@ func _tick_all_dots():
 				if lock["speck"] in specks:
 					lock["speck"].queue_free()
 					specks.erase(lock["speck"])
+				# The soul credit sits OUTSIDE the speck-in-specks check on purpose.
+				# "The lock is the receipt": every resolved lock credits the pool whether
+				# or not the speck node survived, so simultaneous arrivers each credit.
 				var collector_colony = dot_data[dot]["colony"]
 				soul_pool[collector_colony] = soul_pool.get(collector_colony, 0) + 1
 				dot_data[dot]["collect_lock"] = null
@@ -521,7 +546,9 @@ func _execute_primitive(dot: Node3D, primitive: String, dials: Dictionary):
 			_execute_build(dot)
 		"observe":
 			_execute_observe(dot)
-		# gather, mark_surface, face_target: reserved \u2014 no-op
+		# mark_surface, face_target: reserved no-op (no executor here).
+		# gather also has no match-case executor, but its CCE weight is NOT inert: it
+		# gates directed move via OBSERVE_MOVE_MAP (speck -> gather).
 
 func _execute_attack(dot: Node3D, intensity: float):
 	var my_colony = dot_data[dot]["colony"]
@@ -653,6 +680,9 @@ func _execute_observe(dot: Node3D) -> void:
 			best_banner_dist = d
 			banner_entry = { "pos": _cell_to_dir(banner["cell"]), "cell": banner["cell"] }
 
+	# Only entries mapped in OBSERVE_MOVE_MAP are consumed today (speck -> gather).
+	# enemy / ally / banner are sensed and stored but dormant; no consumer yet
+	# (combat-walls design pending, see DEVNOTES 2026-05-13).
 	dot_data[dot]["pending_observe"] = {
 		"enemy": enemy_entry,
 		"speck": speck_entry,
@@ -669,12 +699,18 @@ func _is_at_or_adjacent(a: Vector2i, b: Vector2i) -> bool:
 func _find_eligible_build_banner(dot: Node3D, my_cell: Vector2i, my_colony: int):
 	if build_banners.is_empty():
 		return null
+	# build_banners_used is never written anywhere, so used.has(...) below is always
+	# false. Dormant plumbing retained deliberately (easy to re-enable a per-dot banner
+	# cooldown); see DEVNOTES 2026-05-12.
 	var used = dot_data[dot].get("build_banners_used", {})
 	var best = null
 	var best_dist = BUILD_BANNER_RADIUS * BUILD_BANNER_RADIUS + 1
 	for banner in build_banners:
 		if banner["colony"] != my_colony:
 			continue
+		# Load-bearing (not routine filtering): a banner marked expired mid-tick because
+		# its wall_cap was hit must be invisible to lookup for the rest of the tick, or
+		# remaining builders overshoot the cap. TTL cleanup removes it next tick.
 		if banner["ticks_remaining"] <= 0:
 			continue
 		if used.has(banner["id"]):
@@ -685,6 +721,9 @@ func _find_eligible_build_banner(dot: Node3D, my_cell: Vector2i, my_colony: int)
 			best = banner
 	return best
 
+# Intentionally retained dead code (no caller; see DEVNOTES 2026-05-12). Also the only
+# place in this file that wraps grid neighbors correctly with (+ GRID_RES) before the
+# modulo, so it doubles as the reference seam-wrap idiom.
 func _pick_lateral_cell(banner_cell: Vector2i, colony: int) -> Vector2i:
 	# Returns a neighbor of banner_cell preferring empty (no same-colony wall) cells.
 	# Falls back to a random neighbor if all 8 contain same-colony walls.
@@ -921,6 +960,8 @@ func _tick_combat_clusters():
 			_place_dot_on_sphere(winner, adv["target_dir"])
 
 func _remove_dot(dot: Node3D):
+	# Synchronous: dot_data is erased here before queue_free, so callers may rely on
+	# dot_data.has(dot) alone for liveness (grid lookups do this, no is_instance_valid).
 	if not dot_data.has(dot):
 		return
 	# Incrementally remove from spatial grid
@@ -964,6 +1005,9 @@ func _remove_dot(dot: Node3D):
 	dot_data.erase(dot)
 	combat_locked.erase(dot)
 	if dot == player_dot:
+		# Fallback may resolve to a wall or an enemy-colony dot. Harmless today because
+		# player_dot is only read at _ready by spawn functions, never at runtime; a trap
+		# if anything starts reading it mid-game.
 		player_dot = dots[0] if dots.size() > 0 else null
 	dot.queue_free()
 
@@ -1069,6 +1113,7 @@ func _is_cell_occupied(dir: Vector3) -> bool:
 	var key = _cell_key(dir)
 	return spatial_grid.has(key) and spatial_grid[key].size() > 0
 
+# Exact-cell foreign check: used by marches that advance right up to the line.
 func _is_foreign_in_exact_cell(dir: Vector3, my_colony: int) -> bool:
 	var key = _cell_key(dir)
 	if not spatial_grid.has(key):
@@ -1078,6 +1123,7 @@ func _is_foreign_in_exact_cell(dir: Vector3, my_colony: int) -> bool:
 			return true
 	return false
 
+# 3x3-neighborhood foreign check: used by wander/spawn for separation from foreigners.
 func _is_blocked_by_foreign(dir: Vector3, my_colony: int) -> bool:
 	var key = _cell_key(dir)
 	for du in [-1, 0, 1]:
@@ -1100,6 +1146,8 @@ func _find_nearest_foreign_in_radius(dir: Vector3, my_colony: int, radius: int):
 				for occupant in spatial_grid[neighbor]:
 					if dot_data.has(occupant) and dot_data[occupant]["colony"] != my_colony:
 						var occ_key = dot_cell.get(occupant, _cell_key(occupant.position.normalized()))
+						# Box (non-wrapping) distance metric, an accepted choice here;
+						# torus-wrapped distance is used elsewhere (_torus_cell_dist_sq).
 						var d = float((key - occ_key).length_squared())
 						if d < best_dist:
 							best_dist = d
@@ -1124,6 +1172,8 @@ func _find_nearest_ally_in_radius(dir: Vector3, my_colony: int, radius: int, exc
 					if dot_data[occupant]["colony"] != my_colony:
 						continue
 					var occ_key = dot_cell.get(occupant, _cell_key(occupant.position.normalized()))
+					# Box (non-wrapping) distance metric, an accepted choice here;
+					# torus-wrapped distance is used elsewhere (_torus_cell_dist_sq).
 					var d = float((key - occ_key).length_squared())
 					if d < best_dist:
 						best_dist = d
@@ -1221,6 +1271,7 @@ func _spawn_dot_near(parent: Node3D, colony: int = LOCAL_COLONY):
 	var nudge = (tangent * cos(angle) + bitangent * sin(angle)) * SPAWN_NUDGE
 	var new_dir = (dir + nudge).normalized()
 	if not _is_cell_occupied(new_dir) and not _is_blocked_by_foreign(new_dir, colony):
+		# full_inheritance=true here bypasses CCE_DILUTION (testing posture; see CCE_DILUTION).
 		_create_dot(new_dir, parent, colony, {}, true)
 
 func _create_dot(direction: Vector3, parent, colony: int = LOCAL_COLONY, preset_cce: Dictionary = {}, full_inheritance: bool = false) -> Node3D:
@@ -1236,6 +1287,8 @@ func _create_dot(direction: Vector3, parent, colony: int = LOCAL_COLONY, preset_
 	dot.material_override = mat
 	dot.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_ON
 	add_child(dot)
+	# If this _create_dot came from reproduce during _tick_all_dots, the newborn is
+	# appended to `dots` and ticked in the same pass (see the _tick_all_dots loop note).
 	dots.append(dot)
 
 	var cce = _deep_copy_cce(NEUTRAL_CCE)
@@ -1243,6 +1296,9 @@ func _create_dot(direction: Vector3, parent, colony: int = LOCAL_COLONY, preset_
 		cce = _deep_copy_cce(preset_cce)
 	elif parent != null and dot_data.has(parent):
 		var parent_cce = dot_data[parent]["cce"]
+		# Birth-time dilution: children get CCE_DILUTION * parent weight, applied once
+		# here (between generations), never again during the dot's life. full_inheritance
+		# bypasses it, and is currently always true via _spawn_dot_near.
 		var dilution = 1.0 if full_inheritance else CCE_DILUTION
 		for layer in ["motion", "action"]:
 			for key in cce[layer]:
